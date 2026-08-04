@@ -1,0 +1,2 @@
+/home/cat/workproject/sdk_test/code_test/mhandpro/mhandpro-sdktest/driver/Linux_3.6/xr_usb_serial_common.o
+

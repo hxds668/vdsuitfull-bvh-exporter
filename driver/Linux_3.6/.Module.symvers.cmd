@@ -1,0 +1,1 @@
+cmd_/home/cat/workproject/sdk_test/code_test/mhandpro/mhandpro-sdktest/driver/Linux_3.6/Module.symvers := sed 's/\.ko$$/\.o/' /home/cat/workproject/sdk_test/code_test/mhandpro/mhandpro-sdktest/driver/Linux_3.6/modules.order | scripts/mod/modpost     -o /home/cat/workproject/sdk_test/code_test/mhandpro/mhandpro-sdktest/driver/Linux_3.6/Module.symvers -e -i Module.symvers   -T -

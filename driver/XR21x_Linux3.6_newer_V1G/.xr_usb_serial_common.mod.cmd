@@ -1,0 +1,1 @@
+cmd_/home/cat/vdsuitfull-bvh-exporter/driver/XR21x_Linux3.6_newer_V1G/xr_usb_serial_common.mod := printf '%s\n'   xr_usb_serial_common.o | awk '!x[$$0]++ { print("/home/cat/vdsuitfull-bvh-exporter/driver/XR21x_Linux3.6_newer_V1G/"$$0) }' > /home/cat/vdsuitfull-bvh-exporter/driver/XR21x_Linux3.6_newer_V1G/xr_usb_serial_common.mod

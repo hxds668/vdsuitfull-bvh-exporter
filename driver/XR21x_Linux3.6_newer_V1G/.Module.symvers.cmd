@@ -1,0 +1,1 @@
+cmd_/home/cat/vdsuitfull-bvh-exporter/driver/XR21x_Linux3.6_newer_V1G/Module.symvers :=  sed 's/ko$$/o/'  /home/cat/vdsuitfull-bvh-exporter/driver/XR21x_Linux3.6_newer_V1G/modules.order | scripts/mod/modpost -m -a     -o /home/cat/vdsuitfull-bvh-exporter/driver/XR21x_Linux3.6_newer_V1G/Module.symvers -e -i Module.symvers -T - 

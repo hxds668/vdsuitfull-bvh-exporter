@@ -1,0 +1,1 @@
+cmd_/home/cat/workproject/sdk_test/code_test/mhandpro/mhandpro-sdktest/driver/Linux_3.6/modules.order := {   echo /home/cat/workproject/sdk_test/code_test/mhandpro/mhandpro-sdktest/driver/Linux_3.6/xr_usb_serial_common.ko; :; } | awk '!x[$$0]++' - > /home/cat/workproject/sdk_test/code_test/mhandpro/mhandpro-sdktest/driver/Linux_3.6/modules.order
