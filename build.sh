@@ -19,7 +19,7 @@ mkdir -p "$(dirname "$OUTPUT")"
 
 echo "Building for $ARCH -> $OUTPUT"
 g++ -std=c++11 -O2 -Wall -Wextra -I./include \
-  ./src/main.cpp ./src/bvh_exporter.cpp \
+  ./src/main.cpp ./src/bvh_exporter.cpp ./src/network_streamer.cpp \
   -ldl -lpthread -o "$OUTPUT"
 
 echo "Build OK: $OUTPUT"

@@ -1,4 +1,5 @@
 #include "bvh_exporter.h"
+#include "mocap_skeleton.h"
 
 #include <cmath>
 #include <fstream>
@@ -13,6 +14,15 @@ constexpr float kRadToDeg = 57.29578f;
 
 static const int kBodyParent[NODES_BODY] = {
     -1, 0, 1, 2, 3, 0, 5, 6, 7, 0, 9, 10, 11, 12, 13, 12, 15, 16, 17, 12, 19, 20, 21
+};
+
+static const int kSwappedBodySdkIndex[NODES_BODY] = {
+    BN_Hips,
+    BN_LeftUpperLeg, BN_LeftLowerLeg, BN_LeftFoot, BN_LeftToe,
+    BN_RightUpperLeg, BN_RightLowerLeg, BN_RightFoot, BN_RightToe,
+    BN_Spine, BN_Spine1, BN_Spine2, BN_Spine3, BN_Neck, BN_Head,
+    BN_LeftShoulder, BN_LeftUpperArm, BN_LeftLowerArm, BN_LeftHand,
+    BN_RightShoulder, BN_RightUpperArm, BN_RightLowerArm, BN_RightHand
 };
 
 static const float kBodyOffset[NODES_BODY][3] = {
@@ -49,16 +59,12 @@ static const char* kBodyName[NODES_BODY] = {
     "LeftShoulder", "LeftUpperArm", "LeftLowerArm", "LeftHand"
 };
 
-enum class BvhSourceKind {
-    Body,
-    RightHand,
-    LeftHand
-};
+using BvhSourceKind = MocapJointSource;
 
 struct BvhNodeDef {
     const char* name;
     int parent;
-    BvhSourceKind source;
+    MocapJointSource source;
     int sdkIndex;
     float offset[3];
     float endOffset[3];
@@ -66,7 +72,7 @@ struct BvhNodeDef {
 };
 
 static const BvhNodeDef kFullNodes[] = {
-    {"Hips", -1, BvhSourceKind::Body, BN_Hips, {0.0f, 111.0f, 0.0f}, {0, 0, 0}, false},
+    {"Hips", -1, MocapJointSource::Body, BN_Hips, {0.0f, 111.0f, 0.0f}, {0, 0, 0}, false},
     {"RightUpperLeg", 0, BvhSourceKind::Body, BN_RightUpperLeg, {-10.5f, -8.8f, 0.0f}, {0, 0, 0}, false},
     {"RightLowerLeg", 1, BvhSourceKind::Body, BN_RightLowerLeg, {0.0f, -45.6f, 0.0f}, {0, 0, 0}, false},
     {"RightFoot", 2, BvhSourceKind::Body, BN_RightFoot, {0.0f, -46.7f, 0.0f}, {0, 0, 0}, false},
@@ -269,6 +275,55 @@ bool hasBodyChild(int node)
 
 } // namespace
 
+int swappedBodySdkIndex(int outputIndex)
+{
+    if (outputIndex < 0 || outputIndex >= NODES_BODY) return outputIndex;
+    return kSwappedBodySdkIndex[outputIndex];
+}
+
+const std::vector<MocapJointDefinition>& mocapJointDefinitions()
+{
+    static const std::vector<MocapJointDefinition> definitions = [] {
+        std::vector<MocapJointDefinition> result;
+        result.reserve(NODES_BODY);
+        for (int i = 0; i < NODES_BODY; ++i) {
+            MocapJointDefinition joint = {
+                kBodyName[i],
+                kBodyParent[i],
+                MocapJointSource::Body,
+                swappedBodySdkIndex(i)
+            };
+            result.push_back(joint);
+        }
+        return result;
+    }();
+    return definitions;
+}
+
+const float* mocapJointPosition(const _MocapDataWithVirtual_& md,
+                                const MocapJointDefinition& joint)
+{
+    if (joint.source == MocapJointSource::Body) {
+        return md.position_body[joint.sdkIndex];
+    }
+    if (joint.source == MocapJointSource::RightHand) {
+        return md.position_rHand[joint.sdkIndex];
+    }
+    return md.position_lHand[joint.sdkIndex];
+}
+
+const float* mocapJointQuaternion(const _MocapDataWithVirtual_& md,
+                                  const MocapJointDefinition& joint)
+{
+    if (joint.source == MocapJointSource::Body) {
+        return md.quaternion_body[joint.sdkIndex];
+    }
+    if (joint.source == MocapJointSource::RightHand) {
+        return md.quaternion_rHand[joint.sdkIndex];
+    }
+    return md.quaternion_lHand[joint.sdkIndex];
+}
+
 BvhExporter::BvhExporter()
 {
     pthread_mutex_init(&mutex_, nullptr);
@@ -405,13 +460,15 @@ std::string BvhExporter::buildMotionLine(const _MocapDataWithVirtual_& md) const
     float rz = md.position_body[BN_Hips][1] * 100.0f;
 
     float bodyQ[NODES_BODY][4];
-    for (int i = 0; i < NODES_BODY; ++i) sdkQuatToBvh(md.quaternion_body[i], bodyQ[i]);
+    for (int i = 0; i < NODES_BODY; ++i) {
+        sdkQuatToBvh(md.quaternion_body[swappedBodySdkIndex(i)], bodyQ[i]);
+    }
 
     float rHandQ[NODES_HAND][4];
     float lHandQ[NODES_HAND][4];
     for (int i = 0; i < NODES_HAND; ++i) {
-        sdkQuatToBvh(md.quaternion_rHand[i], rHandQ[i]);
-        sdkQuatToBvh(md.quaternion_lHand[i], lHandQ[i]);
+        sdkQuatToBvh(md.quaternion_lHand[i], rHandQ[i]);
+        sdkQuatToBvh(md.quaternion_rHand[i], lHandQ[i]);
     }
 
     std::ostringstream oss;

@@ -1,4 +1,5 @@
 #include "bvh_exporter.h"
+#include "network_streamer.h"
 
 #include <atomic>
 #include <cmath>
@@ -12,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -49,6 +51,8 @@ struct AppOptions {
     int durationSeconds = 0;
     BvhExportMode mode = BvhExportMode::FullHands;
     bool prependStudioRestFrame = true;
+    std::string sendIp;
+    uint16_t sendPort = 0;
 };
 
 class RawTerminalGuard {
@@ -218,6 +222,7 @@ private:
 };
 
 BvhExporter g_exporter;
+std::atomic<NetworkStreamer*> g_networkStreamer(nullptr);
 std::atomic<bool> g_connected(false);
 std::atomic<bool> g_showData(false);
 volatile std::sig_atomic_t g_shutdownSignal = 0;
@@ -225,6 +230,14 @@ std::mutex g_latestMocapMutex;
 _MocapDataWithVirtual_ g_latestMocap {};
 std::chrono::steady_clock::time_point g_latestMocapTime {};
 bool g_haveLatestMocap = false;
+
+bool stopNetworkForwardingIfActive()
+{
+    NetworkStreamer* streamer = g_networkStreamer.exchange(nullptr, std::memory_order_acq_rel);
+    if (!streamer) return false;
+    streamer->stop();
+    return true;
+}
 
 float g_initialBody[NODES_BODY][3] = {
     {0, 0, 1.11f}, {0.105f, 0, 1.022f}, {0.105f, 0, 0.566f}, {0.105f, 0, 0.099f}, {0.105f, 0.121f, 0.019f},
@@ -266,6 +279,8 @@ void onMocapDataWithVirtual(_MocapDataWithVirtual_ md)
         g_haveLatestMocap = true;
     }
 
+    NetworkStreamer* streamer = g_networkStreamer.load(std::memory_order_acquire);
+    if (streamer) streamer->enqueueFrame(md);
     g_exporter.addFrame(md);
     if (!g_showData || !md.isUpdate) return;
     std::cout << "\rframe=" << md.frameIndex
@@ -275,6 +290,7 @@ void onMocapDataWithVirtual(_MocapDataWithVirtual_ md)
 void onDeviceBreak()
 {
     g_connected = false;
+    stopNetworkForwardingIfActive();
     std::cout << "\nDevice disconnected unexpectedly.\n";
 }
 
@@ -592,6 +608,7 @@ void printUsage()
         << "  --out DIR              output directory, default: records\n"
         << "  --freq N               set device frequency: 60, 72, 80, 96\n"
         << "  --duration SEC         auto record for SEC seconds then save and exit\n"
+        << "  --send IP:PORT         configure UDP target; press S to start forwarding\n"
         << "  --body-only            export body-only BVH\n"
         << "  --no-rest-frame        do not prepend Studio rest frame\n"
         << "  --help                 show this help\n";
@@ -612,6 +629,12 @@ bool parseArgs(int argc, char** argv, AppOptions& options)
             options.frequency = std::stoi(argv[++i]);
         } else if (arg == "--duration" && i + 1 < argc) {
             options.durationSeconds = std::stoi(argv[++i]);
+        } else if (arg == "--send" && i + 1 < argc) {
+            std::string error;
+            if (!parseNetworkEndpoint(argv[++i], options.sendIp, options.sendPort, error)) {
+                std::cerr << "Invalid --send endpoint: " << error << "\n";
+                return false;
+            }
         } else if (arg == "--body-only") {
             options.mode = BvhExportMode::BodyOnly;
         } else if (arg == "--no-rest-frame") {
@@ -678,10 +701,11 @@ bool connectDevice(SdkApi& sdk, const AppOptions& options)
 void disconnectDevice(SdkApi& sdk, bool quiet = false)
 {
     bool wasConnected = g_connected.exchange(false);
+    bool wasForwarding = stopNetworkForwardingIfActive();
     g_exporter.cancel();
     bool cleaned = sdk.cleanupConnection();
     resetLatestMocap();
-    if (!quiet && (wasConnected || cleaned)) {
+    if (!quiet && (wasConnected || cleaned || wasForwarding)) {
         std::cout << "Disconnected.\n";
     }
 }
@@ -733,7 +757,32 @@ void runAutoRecord(SdkApi& sdk, const AppOptions& options)
     disconnectDevice(sdk);
 }
 
-void showMenu(const SdkApi& sdk)
+void toggleNetworkForwarding(NetworkStreamer* streamer)
+{
+    if (!streamer) {
+        std::cout << "Configure a target first with --send IP:PORT.\n";
+        return;
+    }
+
+    if (streamer->isRunning()) {
+        stopNetworkForwardingIfActive();
+        std::cout << "UDP forwarding stopped.\n";
+        return;
+    }
+
+    if (!g_connected) {
+        std::cout << "Please connect the device before starting UDP forwarding.\n";
+        return;
+    }
+
+    streamer->start();
+    g_networkStreamer.store(streamer, std::memory_order_release);
+    std::cout << "UDP forwarding started.\n";
+}
+
+void showMenu(const SdkApi& sdk,
+              const AppOptions& options,
+              const NetworkStreamer* streamer)
 {
     std::cout << "\n==== VDSuitFull Linux BVH Exporter ====\n";
     if (g_connected) {
@@ -745,6 +794,12 @@ void showMenu(const SdkApi& sdk)
     std::cout << "BVH: " << (g_exporter.mode() == BvhExportMode::FullHands ? "FullHands" : "BodyOnly")
               << ", rest frame=" << (g_exporter.prependStudioRestFrame() ? "on" : "off")
               << ", recording=" << (g_exporter.isRecording() ? "yes" : "no") << "\n";
+    if (streamer) {
+        std::cout << "UDP: target=" << options.sendIp << ':' << options.sendPort
+                  << ", forwarding=" << (streamer->isRunning() ? "yes" : "no") << "\n";
+    } else {
+        std::cout << "UDP: target not configured\n";
+    }
     std::cout << "1. Connect\n";
     std::cout << "2. Disconnect\n";
     std::cout << "3. Start/stop BVH recording\n";
@@ -755,6 +810,7 @@ void showMenu(const SdkApi& sdk)
     std::cout << "8. Show gesture\n";
     std::cout << "9. A-pose calibration\n";
     std::cout << "P. P-pose calibration\n";
+    std::cout << "S. Start/stop UDP forwarding\n";
     std::cout << "0. Exit\n";
     std::cout << "Select: ";
 }
@@ -856,11 +912,13 @@ void doCalibration(SdkApi& sdk, _CalibrationMode_ mode)
     }
 }
 
-void runInteractive(SdkApi& sdk, const AppOptions& options)
+void runInteractive(SdkApi& sdk,
+                    const AppOptions& options,
+                    NetworkStreamer* streamer)
 {
     std::string line;
     while (!shutdownRequested()) {
-        showMenu(sdk);
+        showMenu(sdk, options, streamer);
         if (!std::getline(std::cin, line)) break;
         if (shutdownRequested()) break;
         if (line.empty()) continue;
@@ -912,6 +970,10 @@ void runInteractive(SdkApi& sdk, const AppOptions& options)
         case 'p':
             doCalibration(sdk, CM_Ppose);
             break;
+        case 'S':
+        case 's':
+            toggleNetworkForwarding(streamer);
+            break;
         case '0':
             disconnectDevice(sdk);
             return;
@@ -944,12 +1006,35 @@ int main(int argc, char** argv)
     sdk.setVDMocapDataWithVirtualCallBackFunc(onMocapDataWithVirtual);
     sdk.setDeviceBreakCallBackFunc(onDeviceBreak);
 
+    std::unique_ptr<NetworkStreamer> networkStreamer;
+    if (!options.sendIp.empty()) {
+        networkStreamer.reset(new NetworkStreamer(
+            options.sendIp,
+            options.sendPort,
+            g_initialBody));
+        std::cout << "UDP target configured: " << options.sendIp << ':' << options.sendPort;
+        if (options.durationSeconds > 0) {
+            std::cout << ". Forwarding remains off in auto-record mode.\n";
+        } else {
+            std::cout << ". Press S after connecting to start forwarding.\n";
+        }
+    }
+
     if (options.durationSeconds > 0) {
         runAutoRecord(sdk, options);
     } else {
-        runInteractive(sdk, options);
+        runInteractive(sdk, options, networkStreamer.get());
     }
 
     disconnectDevice(sdk, true);
+    g_networkStreamer.store(nullptr, std::memory_order_release);
+    if (networkStreamer) {
+        networkStreamer->stop();
+        uint64_t dropped = networkStreamer->droppedFrameCount();
+        if (dropped > 0) {
+            std::cout << "Network stream dropped " << dropped
+                      << " old frames to preserve realtime delivery.\n";
+        }
+    }
     return shutdownRequested() ? shutdownExitCode() : 0;
 }
