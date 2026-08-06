@@ -16,15 +16,6 @@ static const int kBodyParent[NODES_BODY] = {
     -1, 0, 1, 2, 3, 0, 5, 6, 7, 0, 9, 10, 11, 12, 13, 12, 15, 16, 17, 12, 19, 20, 21
 };
 
-static const int kSwappedBodySdkIndex[NODES_BODY] = {
-    BN_Hips,
-    BN_LeftUpperLeg, BN_LeftLowerLeg, BN_LeftFoot, BN_LeftToe,
-    BN_RightUpperLeg, BN_RightLowerLeg, BN_RightFoot, BN_RightToe,
-    BN_Spine, BN_Spine1, BN_Spine2, BN_Spine3, BN_Neck, BN_Head,
-    BN_LeftShoulder, BN_LeftUpperArm, BN_LeftLowerArm, BN_LeftHand,
-    BN_RightShoulder, BN_RightUpperArm, BN_RightLowerArm, BN_RightHand
-};
-
 static const float kBodyOffset[NODES_BODY][3] = {
     { 0.0f, 111.0f,  0.0f},
     {-10.5f,  -8.8f,  0.0f},
@@ -275,12 +266,6 @@ bool hasBodyChild(int node)
 
 } // namespace
 
-int swappedBodySdkIndex(int outputIndex)
-{
-    if (outputIndex < 0 || outputIndex >= NODES_BODY) return outputIndex;
-    return kSwappedBodySdkIndex[outputIndex];
-}
-
 const std::vector<MocapJointDefinition>& mocapJointDefinitions()
 {
     static const std::vector<MocapJointDefinition> definitions = [] {
@@ -291,7 +276,7 @@ const std::vector<MocapJointDefinition>& mocapJointDefinitions()
                 kBodyName[i],
                 kBodyParent[i],
                 MocapJointSource::Body,
-                swappedBodySdkIndex(i)
+                i
             };
             result.push_back(joint);
         }
@@ -461,14 +446,14 @@ std::string BvhExporter::buildMotionLine(const _MocapDataWithVirtual_& md) const
 
     float bodyQ[NODES_BODY][4];
     for (int i = 0; i < NODES_BODY; ++i) {
-        sdkQuatToBvh(md.quaternion_body[swappedBodySdkIndex(i)], bodyQ[i]);
+        sdkQuatToBvh(md.quaternion_body[i], bodyQ[i]);
     }
 
     float rHandQ[NODES_HAND][4];
     float lHandQ[NODES_HAND][4];
     for (int i = 0; i < NODES_HAND; ++i) {
-        sdkQuatToBvh(md.quaternion_lHand[i], rHandQ[i]);
-        sdkQuatToBvh(md.quaternion_rHand[i], lHandQ[i]);
+        sdkQuatToBvh(md.quaternion_rHand[i], rHandQ[i]);
+        sdkQuatToBvh(md.quaternion_lHand[i], lHandQ[i]);
     }
 
     std::ostringstream oss;

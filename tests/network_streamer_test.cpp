@@ -134,11 +134,11 @@ void testSkeletonAndFrameSerialization()
     assert(definitions.size() == 23);
     const int expectedSdkIndex[NODES_BODY] = {
         BN_Hips,
-        BN_LeftUpperLeg, BN_LeftLowerLeg, BN_LeftFoot, BN_LeftToe,
         BN_RightUpperLeg, BN_RightLowerLeg, BN_RightFoot, BN_RightToe,
+        BN_LeftUpperLeg, BN_LeftLowerLeg, BN_LeftFoot, BN_LeftToe,
         BN_Spine, BN_Spine1, BN_Spine2, BN_Spine3, BN_Neck, BN_Head,
-        BN_LeftShoulder, BN_LeftUpperArm, BN_LeftLowerArm, BN_LeftHand,
-        BN_RightShoulder, BN_RightUpperArm, BN_RightLowerArm, BN_RightHand
+        BN_RightShoulder, BN_RightUpperArm, BN_RightLowerArm, BN_RightHand,
+        BN_LeftShoulder, BN_LeftUpperArm, BN_LeftLowerArm, BN_LeftHand
     };
     std::set<std::string> names;
     for (std::size_t i = 0; i < definitions.size(); ++i) {
@@ -146,7 +146,6 @@ void testSkeletonAndFrameSerialization()
         assert(names.insert(definitions[i].name).second);
         assert(definitions[i].source == MocapJointSource::Body);
         assert(definitions[i].sdkIndex == expectedSdkIndex[i]);
-        assert(swappedBodySdkIndex(static_cast<int>(i)) == expectedSdkIndex[i]);
     }
 
     float body[NODES_BODY][3] {};
@@ -162,13 +161,13 @@ void testSkeletonAndFrameSerialization()
 
     _MocapDataWithVirtual_ md = makeFrame(77);
     assert(mocapJointPosition(md, definitions[BN_RightHand])[0] ==
-           md.position_body[BN_LeftHand][0]);
-    assert(mocapJointPosition(md, definitions[BN_LeftHand])[0] ==
            md.position_body[BN_RightHand][0]);
+    assert(mocapJointPosition(md, definitions[BN_LeftHand])[0] ==
+           md.position_body[BN_LeftHand][0]);
     assert(mocapJointPosition(md, definitions[BN_RightFoot])[0] ==
-           md.position_body[BN_LeftFoot][0]);
+           md.position_body[BN_RightFoot][0]);
     assert(mocapJointQuaternion(md, definitions[BN_LeftUpperArm])[1] ==
-           md.quaternion_body[BN_RightUpperArm][1]);
+           md.quaternion_body[BN_LeftUpperArm][1]);
     std::string frame = serializeFrameJsonLine(md);
     assert(frame.back() == '\n');
     assert(frame.find("\"type\":\"frame\"") != std::string::npos);
@@ -231,20 +230,20 @@ void testUdpDatagramsAndOrdering()
     close(receiver);
 }
 
-void testSwappedRotationsAreMirroredWithoutRemovingAbsolutePose()
+void testGlobalRotationsKeepOriginalSideAndComponentSigns()
 {
     _MocapDataWithVirtual_ md = makeFrame(300);
     setIdentityQuaternions(md);
-    const float source[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    const float source[4] = {-0.5f, 0.5f, 0.5f, 0.5f};
     for (int component = 0; component < 4; ++component) {
-        md.quaternion_body[BN_LeftUpperArm][component] = source[component];
+        md.quaternion_body[BN_RightUpperArm][component] = source[component];
     }
     float output[NODES_BODY][4] {};
-    assert(buildMirroredGlobalQuaternions(md, output));
-    assert(std::fabs(output[BN_RightUpperArm][0] - 0.5f) < 1e-6);
+    assert(copyGlobalQuaternions(md, output));
+    assert(std::fabs(output[BN_RightUpperArm][0] + 0.5f) < 1e-6);
     assert(std::fabs(output[BN_RightUpperArm][1] - 0.5f) < 1e-6);
-    assert(std::fabs(output[BN_RightUpperArm][2] + 0.5f) < 1e-6);
-    assert(std::fabs(output[BN_RightUpperArm][3] + 0.5f) < 1e-6);
+    assert(std::fabs(output[BN_RightUpperArm][2] - 0.5f) < 1e-6);
+    assert(std::fabs(output[BN_RightUpperArm][3] - 0.5f) < 1e-6);
     assert(std::fabs(output[BN_LeftUpperArm][0] - 1.0f) < 1e-6);
     assert(std::fabs(output[BN_LeftUpperArm][1]) < 1e-6);
     assert(std::fabs(output[BN_LeftUpperArm][2]) < 1e-6);
@@ -252,17 +251,17 @@ void testSwappedRotationsAreMirroredWithoutRemovingAbsolutePose()
 
     _MocapDataWithVirtual_ invalid {};
     invalid.isUpdate = true;
-    assert(!buildMirroredGlobalQuaternions(invalid, output));
+    assert(!copyGlobalQuaternions(invalid, output));
 }
 
-void testBvhUsesSwappedBodyAndHandSources()
+void testBvhUsesOriginalBodyAndHandSources()
 {
     _MocapDataWithVirtual_ md = makeFrame(200);
     setIdentityQuaternions(md);
-    md.quaternion_body[BN_LeftUpperLeg][0] = 0.7071068f;
-    md.quaternion_body[BN_LeftUpperLeg][1] = 0.7071068f;
+    md.quaternion_body[BN_RightUpperLeg][0] = 0.7071068f;
+    md.quaternion_body[BN_RightUpperLeg][1] = 0.7071068f;
 
-    const std::string bodyPath = "/tmp/vdsuit_swapped_body_test.bvh";
+    const std::string bodyPath = "/tmp/vdsuit_original_body_test.bvh";
     BvhExporter bodyExporter;
     bodyExporter.setMode(BvhExportMode::BodyOnly);
     bodyExporter.setPrependStudioRestFrame(false);
@@ -279,10 +278,10 @@ void testBvhUsesSwappedBodyAndHandSources()
 
     md = makeFrame(201);
     setIdentityQuaternions(md);
-    md.quaternion_lHand[HN_ThumbFinger][0] = 0.7071068f;
-    md.quaternion_lHand[HN_ThumbFinger][1] = 0.7071068f;
+    md.quaternion_rHand[HN_ThumbFinger][0] = 0.7071068f;
+    md.quaternion_rHand[HN_ThumbFinger][1] = 0.7071068f;
 
-    const std::string handsPath = "/tmp/vdsuit_swapped_hands_test.bvh";
+    const std::string handsPath = "/tmp/vdsuit_original_hands_test.bvh";
     BvhExporter handsExporter;
     handsExporter.setMode(BvhExportMode::FullHands);
     handsExporter.setPrependStudioRestFrame(false);
@@ -309,8 +308,8 @@ int main()
     testEndpointParsing();
     testSkeletonAndFrameSerialization();
     testUdpDatagramsAndOrdering();
-    testSwappedRotationsAreMirroredWithoutRemovingAbsolutePose();
-    testBvhUsesSwappedBodyAndHandSources();
+    testGlobalRotationsKeepOriginalSideAndComponentSigns();
+    testBvhUsesOriginalBodyAndHandSources();
     std::cout << "network_streamer_test: OK\n";
     return 0;
 }

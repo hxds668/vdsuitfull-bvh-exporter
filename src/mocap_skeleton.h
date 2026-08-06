@@ -17,13 +17,9 @@ struct MocapJointDefinition {
     int sdkIndex;
 };
 
-// Returns 23 output body joints in _BodyNodes_ order, with left/right limb
-// data sources exchanged by swappedBodySdkIndex().
+// Returns 23 output body joints in the SDK _BodyNodes_ order. Each output
+// joint reads the SDK joint with the same index.
 const std::vector<MocapJointDefinition>& mocapJointDefinitions();
-
-// Maps an output body-joint index to its SDK source index. Left and right
-// limb chains are intentionally exchanged while center joints are unchanged.
-int swappedBodySdkIndex(int outputIndex);
 
 const float* mocapJointPosition(
     const VDSuitMiniDevice::_MocapDataWithVirtual_& md,

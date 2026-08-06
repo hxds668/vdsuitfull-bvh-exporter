@@ -21,7 +21,7 @@ std::string serializeSkeletonJsonLine(
 std::string serializeFrameJsonLine(
     const VDSuitMiniDevice::_MocapDataWithVirtual_& md);
 
-bool buildMirroredGlobalQuaternions(
+bool copyGlobalQuaternions(
     const VDSuitMiniDevice::_MocapDataWithVirtual_& md,
     float outputGlobalQuaternions[NODES_BODY][4]);
 

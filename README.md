@@ -133,9 +133,9 @@ The wire format is compact UTF-8 JSON, with one complete message in each UDP dat
 {"type":"frame","version":1,"frame_index":123,"joints":[{"position":[0,0,1.11],"quaternion":[1,0,0,0]}]}
 ```
 
-The examples above abbreviate the `joints` arrays. Actual messages always contain 23 body joints; hand and finger arrays are not sent. Output indices and names retain `_BodyNodes_` order, but left/right limb data sources are intentionally exchanged: output right leg indices `1–4` read SDK left leg `5–8`, output left leg `5–8` read SDK right leg `1–4`, output right arm `15–18` reads SDK left arm `19–22`, and output left arm `19–22` reads SDK right arm `15–18`. Center joints `0` and `9–14` are unchanged. FullHands BVH also exchanges the left/right finger data sources.
+The examples above abbreviate the `joints` arrays. Actual messages always contain 23 body joints; hand and finger arrays are not sent. Output indices and names use the SDK `_BodyNodes_` order directly. Right-side output joints read right-side SDK joints and left-side output joints read left-side SDK joints. FullHands BVH likewise reads each hand and finger from the matching SDK side.
 
-The JSON schema remains unchanged. Positions stay in SDK `WS_Geo` and use meters. Each `quaternion` remains an absolute global rotation in `w,x,y,z` order. After the left/right source exchange, rotations are mirrored across the lateral X axis as `(w,x,y,z) -> (w,x,-y,-z)`, allowing the player's existing global-to-local conversion to preserve the absolute non-T-pose arm orientation while reversing the left/right rotation basis. Invalid quaternion frames are dropped. Because UDP does not guarantee delivery, start the receiver before the exporter if it needs the one-time skeleton datagram.
+The JSON schema remains unchanged. Positions stay in SDK `WS_Geo` and use meters. Each `quaternion` is copied from the matching SDK body joint as an absolute global rotation in `w,x,y,z` order, without component sign changes or first-frame normalization. Invalid quaternion frames are dropped. Because UDP does not guarantee delivery, start the receiver before the exporter if it needs the one-time skeleton datagram.
 
 Run the network protocol tests with:
 

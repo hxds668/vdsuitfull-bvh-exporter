@@ -90,7 +90,7 @@ std::ostringstream jsonStream()
     return os;
 }
 
-bool normalizeQuaternion(const float input[4], float output[4])
+bool copyValidQuaternion(const float input[4], float output[4])
 {
     double normSquared = 0.0;
     for (int i = 0; i < 4; ++i) {
@@ -98,17 +98,13 @@ bool normalizeQuaternion(const float input[4], float output[4])
         normSquared += static_cast<double>(input[i]) * input[i];
     }
     if (normSquared < 0.25) return false;
-    float inverseNorm = static_cast<float>(1.0 / std::sqrt(normSquared));
-    for (int i = 0; i < 4; ++i) output[i] = input[i] * inverseNorm;
-    if (output[0] < 0.0f) {
-        for (int i = 0; i < 4; ++i) output[i] = -output[i];
-    }
+    for (int i = 0; i < 4; ++i) output[i] = input[i];
     return true;
 }
 
 } // namespace
 
-bool buildMirroredGlobalQuaternions(
+bool copyGlobalQuaternions(
     const _MocapDataWithVirtual_& md,
     float outputGlobalQuaternions[NODES_BODY][4])
 {
@@ -116,16 +112,11 @@ bool buildMirroredGlobalQuaternions(
     if (joints.size() != NODES_BODY) return false;
 
     for (int i = 0; i < NODES_BODY; ++i) {
-        float normalized[4];
-        if (!normalizeQuaternion(
+        if (!copyValidQuaternion(
                 mocapJointQuaternion(md, joints[static_cast<std::size_t>(i)]),
-                normalized)) {
+                outputGlobalQuaternions[i])) {
             return false;
         }
-        outputGlobalQuaternions[i][0] = normalized[0];
-        outputGlobalQuaternions[i][1] = normalized[1];
-        outputGlobalQuaternions[i][2] = -normalized[2];
-        outputGlobalQuaternions[i][3] = -normalized[3];
     }
     return true;
 }
@@ -201,7 +192,7 @@ std::string serializeSkeletonJsonLine(
 std::string serializeFrameJsonLine(const _MocapDataWithVirtual_& md)
 {
     float outputGlobalQuaternions[NODES_BODY][4];
-    if (!buildMirroredGlobalQuaternions(md, outputGlobalQuaternions)) {
+    if (!copyGlobalQuaternions(md, outputGlobalQuaternions)) {
         return std::string();
     }
     const std::vector<MocapJointDefinition>& joints = mocapJointDefinitions();
