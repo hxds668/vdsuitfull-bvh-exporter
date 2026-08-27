@@ -301,6 +301,166 @@ void testBvhUsesOriginalBodyAndHandSources()
     std::remove(handsPath.c_str());
 }
 
+void testHandJointDefinitions()
+{
+    const std::vector<MocapJointDefinition>& definitions = handJointDefinitions();
+    assert(definitions.size() == 40);
+
+    // Right hand (indices 0-19) and left hand (indices 20-39) each have own root
+    assert(definitions[0].parentIndex == -1);
+    assert(definitions[20].parentIndex == -1);
+    assert(std::string(definitions[0].name) == "RightHand");
+    assert(std::string(definitions[20].name) == "LeftHand");
+
+    // Verify non-root joints have parent_index < their own index
+    for (std::size_t i = 0; i < definitions.size(); ++i) {
+        if (definitions[i].parentIndex >= 0) {
+            assert(definitions[i].parentIndex < static_cast<int>(i));
+        }
+    }
+
+    // Verify unique names
+    std::set<std::string> names;
+    for (std::size_t i = 0; i < definitions.size(); ++i) {
+        assert(names.insert(definitions[i].name).second);
+    }
+
+    // Verify right hand source/sdkIndex
+    for (int i = 0; i < 20; ++i) {
+        assert(definitions[static_cast<std::size_t>(i)].source == MocapJointSource::RightHand);
+        assert(definitions[static_cast<std::size_t>(i)].sdkIndex == i);
+    }
+    // Verify left hand source/sdkIndex
+    for (int i = 0; i < 20; ++i) {
+        assert(definitions[static_cast<std::size_t>(20 + i)].source == MocapJointSource::LeftHand);
+        assert(definitions[static_cast<std::size_t>(20 + i)].sdkIndex == i);
+    }
+
+    // Verify finger chain parent indices (right hand)
+    // Thumb: HN_Hand(0) -> ThumbFinger(1) -> ThumbFinger1(2) -> ThumbFinger2(3)
+    assert(definitions[1].parentIndex == 0);   // RightThumbFinger -> RightHand
+    assert(definitions[2].parentIndex == 1);   // RightThumbFinger1 -> RightThumbFinger
+    assert(definitions[3].parentIndex == 2);   // RightThumbFinger2 -> RightThumbFinger1
+    // Index: HN_Hand(0) -> IndexFinger(4) -> IndexFinger1(5) -> ... -> IndexFinger3(7)
+    assert(definitions[4].parentIndex == 0);
+    assert(definitions[5].parentIndex == 4);
+    assert(definitions[7].parentIndex == 6);
+    // Each finger root should parent to HN_Hand
+    assert(definitions[1].parentIndex == 0);   // ThumbFinger
+    assert(definitions[4].parentIndex == 0);   // IndexFinger
+    assert(definitions[8].parentIndex == 0);   // MiddleFinger
+    assert(definitions[12].parentIndex == 0);  // RingFinger
+    assert(definitions[16].parentIndex == 0);  // PinkyFinger
+
+    // Verify left hand finger chain parents (offset by 20)
+    assert(definitions[21].parentIndex == 20);  // LeftThumbFinger -> LeftHand
+    assert(definitions[24].parentIndex == 20);  // LeftIndexFinger -> LeftHand
+}
+
+void testHandSkeletonSerialization()
+{
+    float right[NODES_HAND][3] {};
+    float left[NODES_HAND][3] {};
+    float dummyBody[NODES_BODY][3] {};
+    fillInitialPositions(dummyBody, right, left);
+
+    std::string skeleton = serializeHandSkeletonJsonLine(right, left);
+    assert(skeleton.back() == '\n');
+    assert(skeleton.find("\"type\":\"skeleton\"") != std::string::npos);
+    assert(skeleton.find("\"joint_count\":40") != std::string::npos);
+    assert(countOccurrences(skeleton, "\"initial_position\":") == 40);
+    assert(countOccurrences(skeleton, "\"offset\":") == 40);
+
+    // Verify hand-specific joint names appear
+    assert(skeleton.find("\"RightHand\"") != std::string::npos);
+    assert(skeleton.find("\"LeftHand\"") != std::string::npos);
+    assert(skeleton.find("\"RightThumbFinger\"") != std::string::npos);
+    assert(skeleton.find("\"LeftPinkyFinger3\"") != std::string::npos);
+
+    // Verify initial positions are written (right hand uses 100.0+i, left uses 200.0+i from fillInitialPositions)
+    assert(skeleton.find("100") != std::string::npos);  // RightHand initial position
+    assert(skeleton.find("200") != std::string::npos);  // LeftHand initial position
+}
+
+void testHandFrameSerialization()
+{
+    _MocapDataWithVirtual_ md = makeFrame(55);
+
+    std::string frame = serializeHandFrameJsonLine(md);
+    assert(frame.back() == '\n');
+    assert(frame.find("\"type\":\"frame\"") != std::string::npos);
+    assert(frame.find("\"frame_index\":55") != std::string::npos);
+    assert(countOccurrences(frame, "\"position\":") == 40);
+    assert(countOccurrences(frame, "\"quaternion\":") == 40);
+
+    // Verify right hand data comes from rHand arrays (value 2000.0 + i*10)
+    assert(frame.find("2000") != std::string::npos);
+    // Verify left hand data comes from lHand arrays (value 3000.0 + i*10)
+    assert(frame.find("3000") != std::string::npos);
+    // Body data should not appear
+    assert(frame.find("1000") == std::string::npos);
+
+    // Test invalid quaternion rejection
+    md.quaternion_rHand[HN_Hand][0] = std::nanf("");
+    std::string invalidFrame = serializeHandFrameJsonLine(md);
+    assert(invalidFrame.empty());
+
+    // Reset and test with all-zeros quaternion (norm=0, should be rejected)
+    md = makeFrame(55);
+    std::memset(md.quaternion_rHand, 0, sizeof(md.quaternion_rHand));
+    std::string zeroNormFrame = serializeHandFrameJsonLine(md);
+    assert(zeroNormFrame.empty());
+}
+
+void testHandUdpDatagrams()
+{
+    int receiver = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(receiver >= 0);
+
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    assert(bind(receiver, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    socklen_t addressLength = sizeof(address);
+    assert(getsockname(receiver, reinterpret_cast<sockaddr*>(&address), &addressLength) == 0);
+
+    float right[NODES_HAND][3] {};
+    float left[NODES_HAND][3] {};
+    float dummyBody[NODES_BODY][3] {};
+    fillInitialPositions(dummyBody, right, left);
+
+    NetworkStreamer streamer("127.0.0.1", ntohs(address.sin_port), right, left);
+    assert(!streamer.isRunning());
+    assert(receiveDatagram(receiver, 100).empty());
+
+    streamer.start();
+    assert(streamer.isRunning());
+
+    // First datagram must be the skeleton
+    std::string first = receiveDatagram(receiver, 3000);
+    assert(first.find("\"type\":\"skeleton\"") != std::string::npos);
+    assert(first.find("\"joint_count\":40") != std::string::npos);
+    assert(first.back() == '\n');
+
+    // Then frames
+    streamer.enqueueFrame(makeFrame(101));
+    std::string second = receiveDatagram(receiver, 3000);
+    assert(second.find("\"type\":\"frame\"") != std::string::npos);
+    assert(second.find("\"frame_index\":101") != std::string::npos);
+    assert(second.back() == '\n');
+
+    // Restart sends skeleton again
+    streamer.stop();
+    assert(!streamer.isRunning());
+    streamer.start();
+    std::string restarted = receiveDatagram(receiver, 3000);
+    assert(restarted.find("\"type\":\"skeleton\"") != std::string::npos);
+
+    streamer.stop();
+    close(receiver);
+}
+
 } // namespace
 
 int main()
@@ -310,6 +470,10 @@ int main()
     testUdpDatagramsAndOrdering();
     testGlobalRotationsKeepOriginalSideAndComponentSigns();
     testBvhUsesOriginalBodyAndHandSources();
+    testHandJointDefinitions();
+    testHandSkeletonSerialization();
+    testHandFrameSerialization();
+    testHandUdpDatagrams();
     std::cout << "network_streamer_test: OK\n";
     return 0;
 }

@@ -82,6 +82,16 @@ const float* initialJointPosition(
     return initialBody[joint.sdkIndex];
 }
 
+const float* initialHandJointPosition(
+    const MocapJointDefinition& joint,
+    const float initialRightHand[NODES_HAND][3],
+    const float initialLeftHand[NODES_HAND][3])
+{
+    if (joint.source == MocapJointSource::RightHand)
+        return initialRightHand[joint.sdkIndex];
+    return initialLeftHand[joint.sdkIndex];
+}
+
 std::ostringstream jsonStream()
 {
     std::ostringstream os;
@@ -211,13 +221,169 @@ std::string serializeFrameJsonLine(const _MocapDataWithVirtual_& md)
     return os.str();
 }
 
+const std::vector<MocapJointDefinition>& handJointDefinitions()
+{
+    static const std::vector<MocapJointDefinition> definitions = [] {
+        struct HandJointEntry {
+            const char* name;
+            int parentIndex;
+            MocapJointSource source;
+            int sdkIndex;
+        };
+
+        static const HandJointEntry kRightHand[] = {
+            {"RightHand",          -1, MocapJointSource::RightHand, HN_Hand},
+            {"RightThumbFinger",    0, MocapJointSource::RightHand, HN_ThumbFinger},
+            {"RightThumbFinger1",   1, MocapJointSource::RightHand, HN_ThumbFinger1},
+            {"RightThumbFinger2",   2, MocapJointSource::RightHand, HN_ThumbFinger2},
+            {"RightIndexFinger",    0, MocapJointSource::RightHand, HN_IndexFinger},
+            {"RightIndexFinger1",   4, MocapJointSource::RightHand, HN_IndexFinger1},
+            {"RightIndexFinger2",   5, MocapJointSource::RightHand, HN_IndexFinger2},
+            {"RightIndexFinger3",   6, MocapJointSource::RightHand, HN_IndexFinger3},
+            {"RightMiddleFinger",   0, MocapJointSource::RightHand, HN_MiddleFinger},
+            {"RightMiddleFinger1",  8, MocapJointSource::RightHand, HN_MiddleFinger1},
+            {"RightMiddleFinger2",  9, MocapJointSource::RightHand, HN_MiddleFinger2},
+            {"RightMiddleFinger3", 10, MocapJointSource::RightHand, HN_MiddleFinger3},
+            {"RightRingFinger",     0, MocapJointSource::RightHand, HN_RingFinger},
+            {"RightRingFinger1",   12, MocapJointSource::RightHand, HN_RingFinger1},
+            {"RightRingFinger2",   13, MocapJointSource::RightHand, HN_RingFinger2},
+            {"RightRingFinger3",   14, MocapJointSource::RightHand, HN_RingFinger3},
+            {"RightPinkyFinger",    0, MocapJointSource::RightHand, HN_PinkyFinger},
+            {"RightPinkyFinger1",  16, MocapJointSource::RightHand, HN_PinkyFinger1},
+            {"RightPinkyFinger2",  17, MocapJointSource::RightHand, HN_PinkyFinger2},
+            {"RightPinkyFinger3",  18, MocapJointSource::RightHand, HN_PinkyFinger3},
+        };
+
+        static const HandJointEntry kLeftHand[] = {
+            {"LeftHand",          -1, MocapJointSource::LeftHand, HN_Hand},
+            {"LeftThumbFinger",    0, MocapJointSource::LeftHand, HN_ThumbFinger},
+            {"LeftThumbFinger1",   1, MocapJointSource::LeftHand, HN_ThumbFinger1},
+            {"LeftThumbFinger2",   2, MocapJointSource::LeftHand, HN_ThumbFinger2},
+            {"LeftIndexFinger",    0, MocapJointSource::LeftHand, HN_IndexFinger},
+            {"LeftIndexFinger1",   4, MocapJointSource::LeftHand, HN_IndexFinger1},
+            {"LeftIndexFinger2",   5, MocapJointSource::LeftHand, HN_IndexFinger2},
+            {"LeftIndexFinger3",   6, MocapJointSource::LeftHand, HN_IndexFinger3},
+            {"LeftMiddleFinger",   0, MocapJointSource::LeftHand, HN_MiddleFinger},
+            {"LeftMiddleFinger1",  8, MocapJointSource::LeftHand, HN_MiddleFinger1},
+            {"LeftMiddleFinger2",  9, MocapJointSource::LeftHand, HN_MiddleFinger2},
+            {"LeftMiddleFinger3", 10, MocapJointSource::LeftHand, HN_MiddleFinger3},
+            {"LeftRingFinger",     0, MocapJointSource::LeftHand, HN_RingFinger},
+            {"LeftRingFinger1",   12, MocapJointSource::LeftHand, HN_RingFinger1},
+            {"LeftRingFinger2",   13, MocapJointSource::LeftHand, HN_RingFinger2},
+            {"LeftRingFinger3",   14, MocapJointSource::LeftHand, HN_RingFinger3},
+            {"LeftPinkyFinger",    0, MocapJointSource::LeftHand, HN_PinkyFinger},
+            {"LeftPinkyFinger1",  16, MocapJointSource::LeftHand, HN_PinkyFinger1},
+            {"LeftPinkyFinger2",  17, MocapJointSource::LeftHand, HN_PinkyFinger2},
+            {"LeftPinkyFinger3",  18, MocapJointSource::LeftHand, HN_PinkyFinger3},
+        };
+
+        constexpr int kRightHandCount = static_cast<int>(sizeof(kRightHand) / sizeof(kRightHand[0]));
+        constexpr int kLeftHandCount  = static_cast<int>(sizeof(kLeftHand) / sizeof(kLeftHand[0]));
+
+        std::vector<MocapJointDefinition> result;
+        result.reserve(static_cast<std::size_t>(kRightHandCount + kLeftHandCount));
+
+        for (int i = 0; i < kRightHandCount; ++i) {
+            result.push_back({kRightHand[i].name,
+                              kRightHand[i].parentIndex,
+                              kRightHand[i].source,
+                              kRightHand[i].sdkIndex});
+        }
+        for (int i = 0; i < kLeftHandCount; ++i) {
+            int leftParent = kLeftHand[i].parentIndex;
+            if (leftParent >= 0) leftParent += kRightHandCount;
+            result.push_back({kLeftHand[i].name,
+                              leftParent,
+                              kLeftHand[i].source,
+                              kLeftHand[i].sdkIndex});
+        }
+        return result;
+    }();
+    return definitions;
+}
+
+std::string serializeHandSkeletonJsonLine(
+    const float initialRightHand[NODES_HAND][3],
+    const float initialLeftHand[NODES_HAND][3])
+{
+    const std::vector<MocapJointDefinition>& joints = handJointDefinitions();
+    std::ostringstream os = jsonStream();
+    os << "{\"type\":\"skeleton\",\"version\":1,\"joint_count\":" << joints.size()
+       << ",\"coordinate_system\":\"WS_Geo\",\"position_unit\":\"m\""
+       << ",\"quaternion_order\":\"wxyz\",\"joints\":[";
+
+    for (std::size_t i = 0; i < joints.size(); ++i) {
+        if (i > 0) os << ',';
+        const MocapJointDefinition& joint = joints[i];
+        const float* initial = initialHandJointPosition(joint, initialRightHand, initialLeftHand);
+        float offset[3] = {initial[0], initial[1], initial[2]};
+        if (joint.parentIndex >= 0) {
+            const float* parent = initialHandJointPosition(
+                joints[static_cast<std::size_t>(joint.parentIndex)],
+                initialRightHand, initialLeftHand);
+            offset[0] -= parent[0];
+            offset[1] -= parent[1];
+            offset[2] -= parent[2];
+        }
+
+        os << "{\"index\":" << i << ",\"name\":";
+        writeJsonString(os, joint.name);
+        os << ",\"parent_index\":" << joint.parentIndex << ",\"initial_position\":";
+        writeVec3(os, initial);
+        os << ",\"offset\":";
+        writeVec3(os, offset);
+        os << '}';
+    }
+    os << "]}\n";
+    return os.str();
+}
+
+std::string serializeHandFrameJsonLine(const _MocapDataWithVirtual_& md)
+{
+    const std::vector<MocapJointDefinition>& joints = handJointDefinitions();
+    // Validate all hand quaternions before serializing
+    for (std::size_t i = 0; i < joints.size(); ++i) {
+        float tmp[4];
+        if (!copyValidQuaternion(mocapJointQuaternion(md, joints[i]), tmp)) {
+            return std::string();
+        }
+    }
+
+    std::ostringstream os = jsonStream();
+    os << "{\"type\":\"frame\",\"version\":1,\"frame_index\":" << md.frameIndex
+       << ",\"joints\":[";
+    for (std::size_t i = 0; i < joints.size(); ++i) {
+        if (i > 0) os << ',';
+        os << "{\"position\":";
+        writeVec3(os, mocapJointPosition(md, joints[i]));
+        os << ",\"quaternion\":";
+        writeQuat(os, mocapJointQuaternion(md, joints[i]));
+        os << '}';
+    }
+    os << "]}\n";
+    return os.str();
+}
+
 NetworkStreamer::NetworkStreamer(
     const std::string& ip,
     uint16_t port,
     const float initialBody[NODES_BODY][3])
     : ip_(ip),
       port_(port),
+      content_(NetworkStreamContent::Body),
       skeletonLine_(serializeSkeletonJsonLine(initialBody))
+{
+}
+
+NetworkStreamer::NetworkStreamer(
+    const std::string& ip,
+    uint16_t port,
+    const float initialRightHand[NODES_HAND][3],
+    const float initialLeftHand[NODES_HAND][3])
+    : ip_(ip),
+      port_(port),
+      content_(NetworkStreamContent::Hands),
+      skeletonLine_(serializeHandSkeletonJsonLine(initialRightHand, initialLeftHand))
 {
 }
 
@@ -351,7 +517,9 @@ void NetworkStreamer::workerLoop()
             frame = frames_.front();
             frames_.pop_front();
         }
-        std::string frameLine = serializeFrameJsonLine(frame);
+        std::string frameLine = (content_ == NetworkStreamContent::Body)
+            ? serializeFrameJsonLine(frame)
+            : serializeHandFrameJsonLine(frame);
         if (frameLine.empty()) {
             std::lock_guard<std::mutex> lock(mutex_);
             ++droppedFrames_;

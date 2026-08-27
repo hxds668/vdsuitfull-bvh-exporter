@@ -8,7 +8,12 @@
 #include <string>
 #include <thread>
 
+#include <vector>
+
 #include "../include/VDMocapSDK_VDSuitMini_DataType.h"
+#include "mocap_skeleton.h"
+
+enum class NetworkStreamContent { Body, Hands };
 
 bool parseNetworkEndpoint(const std::string& value,
                           std::string& ip,
@@ -25,11 +30,24 @@ bool copyGlobalQuaternions(
     const VDSuitMiniDevice::_MocapDataWithVirtual_& md,
     float outputGlobalQuaternions[NODES_BODY][4]);
 
+const std::vector<MocapJointDefinition>& handJointDefinitions();
+
+std::string serializeHandSkeletonJsonLine(
+    const float initialRightHand[NODES_HAND][3],
+    const float initialLeftHand[NODES_HAND][3]);
+
+std::string serializeHandFrameJsonLine(
+    const VDSuitMiniDevice::_MocapDataWithVirtual_& md);
+
 class NetworkStreamer {
 public:
     NetworkStreamer(const std::string& ip,
                     uint16_t port,
                     const float initialBody[NODES_BODY][3]);
+    NetworkStreamer(const std::string& ip,
+                    uint16_t port,
+                    const float initialRightHand[NODES_HAND][3],
+                    const float initialLeftHand[NODES_HAND][3]);
     ~NetworkStreamer();
 
     void start();
@@ -50,6 +68,7 @@ private:
 
     std::string ip_;
     uint16_t port_;
+    NetworkStreamContent content_ = NetworkStreamContent::Body;
     std::string skeletonLine_;
 
     mutable std::mutex mutex_;
