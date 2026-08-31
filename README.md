@@ -12,7 +12,7 @@ This is a Linux x64/arm64 command-line BVH recorder for the VDSuitFull Linux SDK
   - Body, head, both hands and fingers.
 - Optionally exports BodyOnly BVH.
 - Optionally streams the 23 body joints to a UDP endpoint as JSON datagrams.
-- Supports A-pose and P-pose calibration from the interactive menu.
+- Supports A-pose, P-pose, and magnetometer calibration from the interactive menu.
 - Prepends a Studio-style rest frame by default:
   - Hips position `0 111 0`.
   - All rotations `0`.
@@ -88,11 +88,17 @@ Interactive menu shortcuts:
 8  Show gesture
 9  A-pose calibration
 P  P-pose calibration
+M  Magnetometer calibration
 S  Start/stop UDP forwarding
+H  Start/stop hand UDP forwarding
 0  Exit
 ```
 
-During calibration, press `Q` to cancel without pressing Enter.
+During pose calibration, press `Q` to cancel without pressing Enter.
+
+For magnetometer calibration, connect the suit, stop BVH recording, and move away from magnets, motors, speakers, and large steel objects. Press `M`, then slowly rotate the body, arms, hands, and fingers through varied 3D orientations. Press `E` when every sensor has been moved sufficiently; press `Q` at any point to cancel. The final report lists failed body, right-hand, and left-hand sensors so those parts can be moved more thoroughly on the next attempt. Pose callbacks and UDP forwarding may pause while the SDK collects raw magnetic samples and resume after calibration ends.
+
+The SDK keeps the active pose-calibration parameters beside the executable in `CalibrationFiles/CQ_0.xml`, `CQ_HR_0.xml`, and `CQ_HL_0.xml`. These fixed names must remain unchanged because the SDK reads them at startup. After a successful A-pose or P-pose calibration, the exporter detects which XML files were saved and creates timestamped snapshots alongside them, for example `CQ_0_20260827_204501_123.xml`. Magnetometer calibration parameters are sent to the device and are not stored in these XML files.
 
 Auto-record for 10 seconds:
 

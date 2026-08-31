@@ -1,4 +1,6 @@
 #include "bvh_exporter.h"
+#include "calibration_backup.h"
+#include "mag_calibration.h"
 #include "network_streamer.h"
 
 #include <atomic>
@@ -104,6 +106,10 @@ public:
     using StartCalibrationFastFunc = bool (*)(_CalibrationMode_, float[4]);
     using CancelCalibrationFunc = void (*)();
     using GetCalibrationProgressFunc = _CalibrationProgress_ (*)();
+    using StartMagCorrectFunc = bool (*)();
+    using EndMagCorrectFunc = bool (*)();
+    using CancelMagCorrectFunc = void (*)();
+    using GetMagCorrectResultFunc = bool (*)(_MagCorrectResult_*);
 
     ~SdkApi()
     {
@@ -144,6 +150,10 @@ public:
         loadOptional(startCalibrationFast, "StartCalibrationFast");
         loadOptional(cancelCalibration, "CancelCalibration");
         loadOptional(getCalibrationProgress, "GetCalibrationProgress");
+        loadOptional(startMagCorrect, "StartMagCorrect");
+        loadOptional(endMagCorrect, "EndMagCorrect");
+        loadOptional(cancelMagCorrect, "CancelMagCorrect");
+        loadOptional(getMagCorrectResult, "GetMagCorrectResult");
 
         if (!ok) {
             dlclose(handle_);
@@ -188,6 +198,10 @@ public:
     StartCalibrationFastFunc startCalibrationFast = nullptr;
     CancelCalibrationFunc cancelCalibration = nullptr;
     GetCalibrationProgressFunc getCalibrationProgress = nullptr;
+    StartMagCorrectFunc startMagCorrect = nullptr;
+    EndMagCorrectFunc endMagCorrect = nullptr;
+    CancelMagCorrectFunc cancelMagCorrect = nullptr;
+    GetMagCorrectResultFunc getMagCorrectResult = nullptr;
 
 private:
     void clearCallbacks()
@@ -432,6 +446,41 @@ const char* calibrationStateName(_CalibrationState_ state)
     case CS_Successed: return "success";
     case CS_Failed: return "failed";
     default: return "unknown";
+    }
+}
+
+bool hasMagCalibrationApi(const SdkApi& sdk)
+{
+    return vdsuit::magCalibrationFunctionsAvailable(
+        sdk.startMagCorrect != nullptr,
+        sdk.endMagCorrect != nullptr,
+        sdk.cancelMagCorrect != nullptr,
+        sdk.getMagCorrectResult != nullptr);
+}
+
+void printFailedMagNodes(const char* label, const std::vector<std::string>& nodes)
+{
+    if (nodes.empty()) return;
+    std::cout << "  " << label << ": ";
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << nodes[i];
+    }
+    std::cout << "\n";
+}
+
+void reportCalibrationBackups(const vdsuit::CalibrationBackupResult& result,
+                              const std::string& directory)
+{
+    for (const std::string& path : result.savedPaths) {
+        std::cout << "Calibration parameter snapshot saved: " << path << "\n";
+    }
+    for (const std::string& error : result.errors) {
+        std::cout << "Warning: calibration parameter snapshot failed: " << error << "\n";
+    }
+    if (!result.anyFileChanged && result.errors.empty()) {
+        std::cout << "Warning: calibration succeeded, but no CQ XML changed in "
+                  << directory << "; no timestamped snapshot was created.\n";
     }
 }
 
@@ -862,6 +911,7 @@ void showMenu(const SdkApi& sdk,
     std::cout << "8. Show gesture\n";
     std::cout << "9. A-pose calibration\n";
     std::cout << "P. P-pose calibration\n";
+    std::cout << "M. Magnetometer calibration\n";
     std::cout << "S. Start/stop body UDP forwarding\n";
     std::cout << "H. Start/stop hand UDP forwarding\n";
     std::cout << "0. Exit\n";
@@ -907,6 +957,13 @@ void doCalibration(SdkApi& sdk, _CalibrationMode_ mode)
     RawTerminalGuard rawTerminal;
     if (mode == CM_Ppose && !waitForLocalPposeReady()) return;
 
+    const std::string calibrationDirectory =
+        vdsuit::calibrationDirectoryForCurrentExecutable();
+    const std::vector<vdsuit::CalibrationFileState> calibrationFilesBefore =
+        calibrationDirectory.empty()
+            ? std::vector<vdsuit::CalibrationFileState>()
+            : vdsuit::captureCalibrationFileStates(calibrationDirectory);
+
     bool started = false;
     if (sdk.startCalibration) {
         started = sdk.startCalibration(mode, quatEndCalibrationRoot);
@@ -941,6 +998,14 @@ void doCalibration(SdkApi& sdk, _CalibrationMode_ mode)
                   << "%   " << std::flush;
 
         if (progress.state == CS_Successed) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            vdsuit::CalibrationBackupResult backupResult =
+                vdsuit::backupChangedCalibrationFiles(
+                    calibrationDirectory,
+                    calibrationFilesBefore,
+                    vdsuit::calibrationSnapshotTimestamp());
+            reportCalibrationBackups(backupResult, calibrationDirectory);
+
             if (mode == CM_Ppose && !isPposeGuardDisabled()) {
                 _MocapDataWithVirtual_ md {};
                 std::string reason = "no recent mocap frame";
@@ -961,6 +1026,136 @@ void doCalibration(SdkApi& sdk, _CalibrationMode_ mode)
             return;
         }
 
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+void doMagCalibration(SdkApi& sdk)
+{
+    if (!g_connected) {
+        std::cout << "Please connect first.\n";
+        return;
+    }
+    if (!hasMagCalibrationApi(sdk)) {
+        std::cout << "Magnetometer calibration symbols are not exported by this SDK library.\n";
+        return;
+    }
+    if (g_exporter.isRecording()) {
+        std::cout << "Stop BVH recording before magnetometer calibration.\n";
+        return;
+    }
+
+    std::cout << "\nStarting magnetometer calibration.\n";
+    std::cout << "Move away from magnets, motors, speakers, and large steel objects.\n";
+    std::cout << "Slowly rotate the body, arms, hands, and fingers through varied 3D orientations.\n";
+    std::cout << "Press E when every sensor has been moved sufficiently; press Q to cancel.\n";
+
+    RawTerminalGuard rawTerminal;
+    if (!sdk.startMagCorrect()) {
+        std::cout << "Magnetometer calibration start failed.\n";
+        return;
+    }
+
+    auto collectionStart = std::chrono::steady_clock::now();
+    while (true) {
+        if (shutdownRequested()) {
+            sdk.cancelMagCorrect();
+            std::cout << "\nMagnetometer calibration canceled by shutdown.\n";
+            return;
+        }
+        if (!g_connected) {
+            sdk.cancelMagCorrect();
+            std::cout << "\nMagnetometer calibration canceled because the device disconnected.\n";
+            return;
+        }
+
+        int key = readKeyNonBlocking();
+        if (key == 'q' || key == 'Q') {
+            sdk.cancelMagCorrect();
+            std::cout << "\nMagnetometer calibration canceled.\n";
+            return;
+        }
+        if (key == 'e' || key == 'E') break;
+
+        long elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - collectionStart).count();
+        std::cout << "\rCollecting magnetic samples: " << elapsed
+                  << "s (E=end, Q=cancel)   " << std::flush;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::cout << "\nFinishing sample collection and calculating corrections.\n";
+    if (!sdk.endMagCorrect()) {
+        sdk.cancelMagCorrect();
+        std::cout << "Magnetometer calibration could not start calculation.\n";
+        return;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (true) {
+        if (shutdownRequested()) {
+            sdk.cancelMagCorrect();
+            std::cout << "\nMagnetometer calibration canceled by shutdown.\n";
+            return;
+        }
+        if (!g_connected) {
+            sdk.cancelMagCorrect();
+            std::cout << "\nMagnetometer calibration canceled because the device disconnected.\n";
+            return;
+        }
+
+        int key = readKeyNonBlocking();
+        if (key == 'q' || key == 'Q') {
+            sdk.cancelMagCorrect();
+            std::cout << "\nMagnetometer calibration canceled.\n";
+            return;
+        }
+
+        _MagCorrectResult_ result {};
+        bool finished = sdk.getMagCorrectResult(&result);
+        std::cout << "\rCalculating magnetometer corrections: "
+                  << vdsuit::magCalibrationProgressPercent(result.progress)
+                  << "% (Q=cancel)   " << std::flush;
+
+        if (finished != result.isFinished) {
+            sdk.cancelMagCorrect();
+            std::cout << "\nMagnetometer calibration returned an inconsistent SDK result.\n";
+            return;
+        }
+        if (finished) {
+            std::cout << "\n";
+            vdsuit::MagCalibrationSummary summary =
+                vdsuit::summarizeMagCalibrationResult(result);
+            switch (summary.outcome) {
+            case vdsuit::MagCalibrationOutcome::Success:
+                std::cout << "Magnetometer calibration succeeded for all detected sensors.\n";
+                return;
+            case vdsuit::MagCalibrationOutcome::PartialSuccess:
+                std::cout << "Magnetometer calibration partially succeeded. Failed sensors:\n";
+                printFailedMagNodes("Body", summary.failedBodyNodes);
+                printFailedMagNodes("Right hand", summary.failedRightHandNodes);
+                printFailedMagNodes("Left hand", summary.failedLeftHandNodes);
+                std::cout << "Move the failed sensors through more orientations, then run M again.\n";
+                return;
+            case vdsuit::MagCalibrationOutcome::Failed:
+                std::cout << "Magnetometer calibration failed: no sensor was calibrated successfully.\n";
+                return;
+            case vdsuit::MagCalibrationOutcome::InvalidResult:
+                sdk.cancelMagCorrect();
+                std::cout << "Magnetometer calibration failed: " << summary.error << ".\n";
+                return;
+            case vdsuit::MagCalibrationOutcome::InProgress:
+                sdk.cancelMagCorrect();
+                std::cout << "Magnetometer calibration returned an incomplete SDK result.\n";
+                return;
+            }
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline) {
+            sdk.cancelMagCorrect();
+            std::cout << "\nMagnetometer calibration timed out after 120 seconds.\n";
+            return;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
@@ -1023,6 +1218,10 @@ void runInteractive(SdkApi& sdk,
         case 'P':
         case 'p':
             doCalibration(sdk, CM_Ppose);
+            break;
+        case 'M':
+        case 'm':
+            doMagCalibration(sdk);
             break;
         case 'S':
         case 's':
