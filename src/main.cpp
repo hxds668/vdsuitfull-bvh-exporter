@@ -1,5 +1,9 @@
 #include "bvh_exporter.h"
 #include "network_streamer.h"
+#include "sdk_virtual_serial.h"
+#include "wireless_hotspot.h"
+#include "wireless_sdk_bridge.h"
+#include "vdsuit_wireless_protocol.h"
 
 #include <atomic>
 #include <cmath>
@@ -10,6 +14,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <fcntl.h>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -55,6 +61,10 @@ struct AppOptions {
     uint16_t sendPort = 0;
     std::string sendHandIp;
     uint16_t sendHandPort = 0;
+    std::string wirelessSsid;
+    std::string wirelessInterface = "wlan0";
+    std::string wirelessApAddress = "192.168.18.1";
+    bool wirelessOptionSeen = false;
 };
 
 class RawTerminalGuard {
@@ -110,6 +120,7 @@ public:
         if (handle_) {
             cleanupConnection();
             clearCallbacks();
+            vdsuit_wireless::setSdkLibraryHandle(nullptr);
             dlclose(handle_);
         }
     }
@@ -124,6 +135,7 @@ public:
             std::cerr << "dlopen failed: " << dlerror() << "\n";
             return false;
         }
+        vdsuit_wireless::setSdkLibraryHandle(handle_);
 
         bool ok = true;
         ok &= loadRequired(setVDMocapDataCallBackFunc, "SetVDMocapDataCallBackFunc");
@@ -146,6 +158,7 @@ public:
         loadOptional(getCalibrationProgress, "GetCalibrationProgress");
 
         if (!ok) {
+            vdsuit_wireless::setSdkLibraryHandle(nullptr);
             dlclose(handle_);
             handle_ = nullptr;
         }
@@ -165,10 +178,23 @@ public:
     bool cleanupConnection()
     {
         if (!handle_ || !connectionTouched_ || !disConnect) return false;
-        disConnect();
+        // After a transport loss the SDK runs its own break cleanup. Calling
+        // DisConnect again in that state races the vendor read thread and has
+        // been observed to trip glibc's fortified-buffer abort path.
+        const bool sdkAlreadyDisconnected =
+            successfulConnection_ && getConnectState && !getConnectState();
+        if (!sdkAlreadyDisconnected) {
+            disConnect();
+        }
         connectionTouched_ = false;
+        successfulConnection_ = false;
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         return true;
+    }
+
+    void markConnected()
+    {
+        successfulConnection_ = true;
     }
 
     SetVDMocapDataCallBackFunc setVDMocapDataCallBackFunc = nullptr;
@@ -221,6 +247,7 @@ private:
 
     void* handle_ = nullptr;
     bool connectionTouched_ = false;
+    bool successfulConnection_ = false;
 };
 
 BvhExporter g_exporter;
@@ -228,7 +255,10 @@ std::atomic<NetworkStreamer*> g_networkStreamer(nullptr);
 std::atomic<NetworkStreamer*> g_networkHandStreamer(nullptr);
 std::atomic<bool> g_connected(false);
 std::atomic<bool> g_showData(false);
+std::atomic<uint64_t> g_sdkFrameCount(0);
+std::atomic<bool> g_disconnectInProgress(false);
 volatile std::sig_atomic_t g_shutdownSignal = 0;
+volatile std::sig_atomic_t g_fatalSignalHandling = 0;
 std::mutex g_latestMocapMutex;
 _MocapDataWithVirtual_ g_latestMocap {};
 std::chrono::steady_clock::time_point g_latestMocapTime {};
@@ -284,6 +314,7 @@ void onMocapData(_MocapData_ md)
 void onMocapDataWithVirtual(_MocapDataWithVirtual_ md)
 {
     if (md.isUpdate) {
+        g_sdkFrameCount.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(g_latestMocapMutex);
         g_latestMocap = md;
         g_latestMocapTime = std::chrono::steady_clock::now();
@@ -303,6 +334,7 @@ void onMocapDataWithVirtual(_MocapDataWithVirtual_ md)
 void onDeviceBreak()
 {
     g_connected = false;
+    if (g_disconnectInProgress.load(std::memory_order_acquire)) return;
     stopNetworkForwardingIfActive();
     stopHandForwardingIfActive();
     std::cout << "\nDevice disconnected unexpectedly.\n";
@@ -311,6 +343,28 @@ void onDeviceBreak()
 void handleShutdownSignal(int signal)
 {
     if (g_shutdownSignal == 0) g_shutdownSignal = signal;
+}
+
+void handleFatalSignal(int signalNumber)
+{
+    if (g_fatalSignalHandling) _exit(128 + signalNumber);
+    g_fatalSignalHandling = 1;
+    const int descriptor = open(
+        "/run/vdsuit-bvh-exporter-crash.log",
+        O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+        0644);
+    if (descriptor >= 0) {
+        const char header[] = "\n=== fatal signal in vdsuit_bvh_exporter ===\n";
+        const ssize_t headerResult = write(descriptor, header, sizeof(header) - 1);
+        (void)headerResult;
+        void* frames[64];
+        const int count = backtrace(frames, 64);
+        backtrace_symbols_fd(frames, count, descriptor);
+        close(descriptor);
+    }
+    signal(signalNumber, SIG_DFL);
+    kill(getpid(), signalNumber);
+    _exit(128 + signalNumber);
 }
 
 void installSignalHandlers()
@@ -322,6 +376,12 @@ void installSignalHandlers()
     sigaction(SIGINT, &action, nullptr);
     sigaction(SIGTERM, &action, nullptr);
     sigaction(SIGHUP, &action, nullptr);
+
+    struct sigaction fatalAction {};
+    fatalAction.sa_handler = handleFatalSignal;
+    sigemptyset(&fatalAction.sa_mask);
+    fatalAction.sa_flags = SA_RESETHAND;
+    sigaction(SIGABRT, &fatalAction, nullptr);
 }
 
 bool shutdownRequested()
@@ -340,7 +400,102 @@ void resetLatestMocap()
     g_latestMocap = _MocapDataWithVirtual_ {};
     g_latestMocapTime = std::chrono::steady_clock::time_point {};
     g_haveLatestMocap = false;
+    g_sdkFrameCount.store(0, std::memory_order_relaxed);
 }
+
+class WirelessRuntime {
+public:
+    ~WirelessRuntime()
+    {
+        vdsuit_wireless::clearSdkVirtualSerialPath();
+        if (bridge_) bridge_->close();
+        if (hotspot_) hotspot_->stop();
+    }
+
+    bool start(const AppOptions& options, std::string& error)
+    {
+        if (options.wirelessSsid.empty()) return true;
+        if (geteuid() != 0) {
+            error = "wireless SDK mode must run as root (use sudo)";
+            return false;
+        }
+        if (!vdsuit_wireless::validateInterfaceName(options.wirelessInterface)) {
+            error = "invalid wireless interface name";
+            return false;
+        }
+        if (!vdsuit_wireless::validateSerialSsid(options.wirelessSsid)) {
+            error = "wireless SSID/serial must contain 1-32 decimal digits";
+            return false;
+        }
+
+        vdsuit_wireless::HotspotConfig hotspotConfig;
+        hotspotConfig.interfaceName = options.wirelessInterface;
+        hotspotConfig.ssid = options.wirelessSsid;
+        if (!vdsuit_wireless::deriveHotspotAddressing(
+                options.wirelessApAddress, hotspotConfig.addressing, error)) {
+            error = "invalid wireless AP address: " + error;
+            return false;
+        }
+
+        std::cout << "Starting isolated SDK hotspot on "
+                  << hotspotConfig.interfaceName << "...\n";
+        hotspot_.reset(new vdsuit_wireless::HotspotManager(hotspotConfig));
+        if (!hotspot_->start(error)) {
+            error = "hotspot startup failed: " + error;
+            return false;
+        }
+        std::cout << "Hotspot ready: SSID=" << hotspotConfig.ssid
+                  << ", password=" << hotspotConfig.passphrase
+                  << ", channel=" << hotspotConfig.channel
+                  << ", AP=" << hotspotConfig.addressing.apCidr
+                  << ", DHCP=" << hotspotConfig.addressing.clientAddress << "\n"
+                  << "Waiting for the transmitter to associate and obtain DHCP...\n";
+
+        if (!hotspot_->waitForClient(shutdownRequested, lease_, error)) {
+            if (shutdownRequested()) error = "shutdown requested while waiting for transmitter";
+            else error = "transmitter wait failed: " + error;
+            return false;
+        }
+        std::cout << "Transmitter ready: MAC=" << lease_.macAddress
+                  << ", IP=" << lease_.ipAddress << "\n";
+
+        vdsuit_wireless::WirelessSdkBridgeConfig bridgeConfig;
+        bridgeConfig.interfaceName = hotspotConfig.interfaceName;
+        bridgeConfig.localAddress = hotspotConfig.addressing.apAddress;
+        bridgeConfig.clientAddress = hotspotConfig.addressing.clientAddress;
+        // The physical receiver uses the limited broadcast address exactly;
+        // preserve that behavior instead of relying on subnet-broadcast rules.
+        bridgeConfig.destinationAddress = "255.255.255.255";
+        bridgeConfig.port = vdsuit_wireless::kProtocolPort;
+        bridge_.reset(new vdsuit_wireless::WirelessSdkBridge(bridgeConfig));
+        if (!bridge_->open(error)) {
+            error = "wireless SDK bridge startup failed: " + error;
+            return false;
+        }
+        vdsuit_wireless::setSdkVirtualSerialPath(bridge_->slavePath());
+        std::cout << "SDK wireless bridge ready: UDP "
+                  << hotspotConfig.addressing.apAddress << ':' << bridge_->localPort()
+                  << " <-> " << bridge_->slavePath() << "\n";
+        return true;
+    }
+
+    bool transmitterDataStale(int64_t& ageMilliseconds) const
+    {
+        if (!bridge_ || !bridge_->active()) {
+            ageMilliseconds = -1;
+            return false;
+        }
+        ageMilliseconds = bridge_->millisecondsSinceLastNetworkFrame();
+        return ageMilliseconds < 0 || ageMilliseconds > 500;
+    }
+
+private:
+    std::unique_ptr<vdsuit_wireless::HotspotManager> hotspot_;
+    std::unique_ptr<vdsuit_wireless::WirelessSdkBridge> bridge_;
+    vdsuit_wireless::ClientLease lease_;
+};
+
+WirelessRuntime* g_wirelessRuntime = nullptr;
 
 bool fileExists(const std::string& path)
 {
@@ -624,6 +779,9 @@ void printUsage()
         << "  --duration SEC         auto record for SEC seconds then save and exit\n"
         << "  --send IP:PORT         configure UDP body target; press S to start\n"
         << "  --send-hand IP:PORT    configure UDP hand target; press H to start\n"
+        << "  --wireless-ssid SERIAL receive through a local Wi-Fi hotspot\n"
+        << "  --wireless-ip ADDRESS  wireless AP address, default: 192.168.18.1\n"
+        << "  --wireless-interface N wireless AP interface, default: wlan0\n"
         << "  --body-only            export body-only BVH\n"
         << "  --no-rest-frame        do not prepend Studio rest frame\n"
         << "  --help                 show this help\n";
@@ -656,6 +814,15 @@ bool parseArgs(int argc, char** argv, AppOptions& options)
                 std::cerr << "Invalid --send-hand endpoint: " << error << "\n";
                 return false;
             }
+        } else if (arg == "--wireless-ssid" && i + 1 < argc) {
+            options.wirelessSsid = argv[++i];
+            options.wirelessOptionSeen = true;
+        } else if (arg == "--wireless-ip" && i + 1 < argc) {
+            options.wirelessApAddress = argv[++i];
+            options.wirelessOptionSeen = true;
+        } else if (arg == "--wireless-interface" && i + 1 < argc) {
+            options.wirelessInterface = argv[++i];
+            options.wirelessOptionSeen = true;
         } else if (arg == "--body-only") {
             options.mode = BvhExportMode::BodyOnly;
         } else if (arg == "--no-rest-frame") {
@@ -665,6 +832,10 @@ bool parseArgs(int argc, char** argv, AppOptions& options)
             printUsage();
             return false;
         }
+    }
+    if (options.wirelessOptionSeen && options.wirelessSsid.empty()) {
+        std::cerr << "--wireless-ssid is required when wireless options are used.\n";
+        return false;
     }
     return true;
 }
@@ -707,12 +878,26 @@ bool connectDevice(SdkApi& sdk, const AppOptions& options)
 
     if (shutdownRequested() || !connected) {
         sdk.cleanupConnection();
-        std::cerr << "Connect failed. Check USB, serial permission, and driver.\n";
+        if (options.wirelessSsid.empty()) {
+            std::cerr << "Connect failed. Check USB, serial permission, and driver.\n";
+        } else {
+            std::cerr << "Connect failed. Check the transmitter, hotspot, and UDP bridge.\n";
+        }
         return false;
     }
 
     g_connected = true;
-    sdk.setFrequency(toSdkFrequency(options.frequency));
+    sdk.markConnected();
+    const int negotiatedFrequency = sdk.getFrequency();
+    if (negotiatedFrequency != options.frequency &&
+        !sdk.setFrequency(toSdkFrequency(options.frequency))) {
+        std::cerr << "Connected, but changing frequency from "
+                  << negotiatedFrequency << "Hz to " << options.frequency
+                  << "Hz failed. Disconnecting this incomplete session.\n";
+        g_connected = false;
+        sdk.cleanupConnection();
+        return false;
+    }
     std::cout << "Connected: " << deviceTypeName(sdk.getDeviceType())
               << ", frequency=" << sdk.getFrequency()
               << "Hz, battery=" << static_cast<int>(sdk.getDevicePower() * 100.0f + 0.5f) << "%\n";
@@ -721,11 +906,27 @@ bool connectDevice(SdkApi& sdk, const AppOptions& options)
 
 void disconnectDevice(SdkApi& sdk, bool quiet = false)
 {
+    g_disconnectInProgress.store(true, std::memory_order_release);
     bool wasConnected = g_connected.exchange(false);
     bool wasForwarding = stopNetworkForwardingIfActive();
     bool wasHandForwarding = stopHandForwardingIfActive();
     g_exporter.cancel();
+
+    int64_t wirelessFrameAge = 0;
+    if (sdk.connectionTouched() && g_wirelessRuntime &&
+        g_wirelessRuntime->transmitterDataStale(wirelessFrameAge)) {
+        std::cerr << "Wireless transmitter data stopped";
+        if (wirelessFrameAge >= 0) {
+            std::cerr << " " << wirelessFrameAge << " ms ago";
+        }
+        std::cerr << "; exiting without the vendor SDK's unsafe DisConnect path.\n"
+                  << "The recovery watchdog is restoring the hotspot and wlan interface.\n"
+                  << std::flush;
+        _exit(0);
+    }
+
     bool cleaned = sdk.cleanupConnection();
+    g_disconnectInProgress.store(false, std::memory_order_release);
     resetLatestMocap();
     if (!quiet && (wasConnected || cleaned || wasForwarding || wasHandForwarding)) {
         std::cout << "Disconnected.\n";
@@ -831,9 +1032,19 @@ void showMenu(const SdkApi& sdk,
               const NetworkStreamer* handStreamer)
 {
     std::cout << "\n==== VDSuitFull Linux BVH Exporter ====\n";
+    if (!options.wirelessSsid.empty()) {
+        std::cout << "Input: wireless, SSID=" << options.wirelessSsid
+                  << ", AP=" << options.wirelessApAddress
+                  << ", interface=" << options.wirelessInterface << "\n";
+    } else {
+        std::cout << "Input: physical USB receiver\n";
+    }
     if (g_connected) {
         std::cout << "Status: connected, " << sdk.getFrequency() << "Hz, battery="
                   << static_cast<int>(sdk.getDevicePower() * 100.0f + 0.5f) << "%\n";
+        std::cout << "SDK output: "
+                  << g_sdkFrameCount.load(std::memory_order_relaxed)
+                  << " processed frames\n";
     } else {
         std::cout << "Status: disconnected\n";
     }
@@ -1053,12 +1264,20 @@ int main(int argc, char** argv)
     g_exporter.setMode(options.mode);
     g_exporter.setPrependStudioRestFrame(options.prependStudioRestFrame);
 
+    WirelessRuntime wirelessRuntime;
+    std::string wirelessError;
+    if (!wirelessRuntime.start(options, wirelessError)) {
+        if (!shutdownRequested()) std::cerr << wirelessError << "\n";
+        return shutdownRequested() ? shutdownExitCode() : 2;
+    }
+    if (!options.wirelessSsid.empty()) g_wirelessRuntime = &wirelessRuntime;
+
     std::string libPath = chooseLibPath(options.libPath);
     std::cout << "SDK library: " << libPath << "\n";
     redirectVendorStdout();
 
     SdkApi sdk;
-    if (!sdk.load(libPath)) return 2;
+    if (!sdk.load(libPath)) return 3;
 
     sdk.setVDMocapDataCallBackFunc(onMocapData);
     sdk.setVDMocapDataWithVirtualCallBackFunc(onMocapDataWithVirtual);
