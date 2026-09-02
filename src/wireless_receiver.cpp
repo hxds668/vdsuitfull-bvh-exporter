@@ -15,12 +15,15 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <vector>
 
@@ -104,6 +107,182 @@ struct StreamStats {
     uint64_t invalidDatagrams = 0;
     std::size_t lastFrameLength = 0;
 };
+
+struct RawRecordingStats {
+    bool active = false;
+    uint64_t frameCount = 0;
+    uint64_t rawBytes = 0;
+    std::string path;
+    std::string error;
+};
+
+std::string serializeRawFrameJsonLine(
+    uint64_t recordIndex,
+    int64_t receivedUnixNanoseconds,
+    uint64_t elapsedNanoseconds,
+    const Frame& frame,
+    const uint8_t* datagram,
+    std::size_t datagramLength)
+{
+    std::ostringstream output;
+    output << "{\"schema\":\"vdsuit-wireless-raw-v1\""
+           << ",\"record_index\":" << recordIndex
+           << ",\"received_unix_ns\":" << receivedUnixNanoseconds
+           << ",\"elapsed_ns\":" << elapsedNanoseconds
+           << ",\"sequence\":" << static_cast<unsigned int>(frame.sequence)
+           << ",\"target\":" << static_cast<unsigned int>(frame.target)
+           << ",\"command\":" << static_cast<unsigned int>(frame.command)
+           << ",\"datagram_length\":" << datagramLength
+           << ",\"payload_length\":" << frame.payload.size()
+           << ",\"wire_hex\":\"" << hexString(datagram, datagramLength) << "\"}";
+    return output.str();
+}
+
+class RawJsonlRecorder {
+public:
+    ~RawJsonlRecorder()
+    {
+        stop();
+    }
+
+    bool start(const std::string& path, std::string& error)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        error.clear();
+        if (active_) {
+            error = "raw JSONL recording is already active";
+            return false;
+        }
+        if (path.empty()) {
+            error = "raw JSONL path is empty";
+            return false;
+        }
+
+        if (output_.is_open()) output_.close();
+        output_.clear();
+        output_.open(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!output_) {
+            error = "cannot open raw JSONL output: " + path;
+            return false;
+        }
+
+        active_ = true;
+        frameCount_ = 0;
+        rawBytes_ = 0;
+        path_ = path;
+        error_.clear();
+        startTime_ = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    RawRecordingStats stop()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (output_.is_open()) {
+            output_.flush();
+            if (!output_ && error_.empty()) error_ = "failed to flush raw JSONL output";
+            output_.close();
+        }
+        active_ = false;
+        return statsLocked();
+    }
+
+    RawRecordingStats stats() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return statsLocked();
+    }
+
+    void record(const Frame& frame,
+                const uint8_t* datagram,
+                std::size_t datagramLength,
+                const std::chrono::system_clock::time_point& receivedSystemTime,
+                const std::chrono::steady_clock::time_point& receivedSteadyTime)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!active_ || !datagram || datagramLength == 0) return;
+        if (receivedSteadyTime < startTime_) return;
+
+        const int64_t receivedUnixNanoseconds =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                receivedSystemTime.time_since_epoch()).count();
+        const uint64_t elapsedNanoseconds = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                receivedSteadyTime - startTime_).count());
+        output_ << serializeRawFrameJsonLine(
+            frameCount_, receivedUnixNanoseconds, elapsedNanoseconds,
+            frame, datagram, datagramLength) << '\n';
+        if (!output_) {
+            error_ = "failed while writing raw JSONL output";
+            active_ = false;
+            output_.close();
+            return;
+        }
+        ++frameCount_;
+        rawBytes_ += datagramLength;
+    }
+
+private:
+    RawRecordingStats statsLocked() const
+    {
+        RawRecordingStats result;
+        result.active = active_;
+        result.frameCount = frameCount_;
+        result.rawBytes = rawBytes_;
+        result.path = path_;
+        result.error = error_;
+        return result;
+    }
+
+    mutable std::mutex mutex_;
+    std::ofstream output_;
+    bool active_ = false;
+    uint64_t frameCount_ = 0;
+    uint64_t rawBytes_ = 0;
+    std::string path_;
+    std::string error_;
+    std::chrono::steady_clock::time_point startTime_ {};
+};
+
+bool defaultRawRecordingPath(std::string& path, std::string& error)
+{
+    const char* directory = "records";
+    if (mkdir(directory, 0755) != 0 && errno != EEXIST) {
+        error = std::string("cannot create records directory: ") + std::strerror(errno);
+        return false;
+    }
+    struct stat info {};
+    if (stat(directory, &info) != 0 || !S_ISDIR(info.st_mode)) {
+        error = "records exists but is not a directory";
+        return false;
+    }
+
+    const std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm localTime {};
+    localtime_r(&time, &localTime);
+    const long long milliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count() % 1000;
+
+    std::ostringstream stem;
+    stem << directory << "/vdsuit_raw_"
+         << std::put_time(&localTime, "%Y%m%d_%H%M%S")
+         << '_' << std::setw(3) << std::setfill('0') << milliseconds;
+    for (int suffix = 0; suffix < 10000; ++suffix) {
+        std::ostringstream candidate;
+        candidate << stem.str();
+        if (suffix > 0) candidate << '_' << suffix;
+        candidate << ".jsonl";
+        if (access(candidate.str().c_str(), F_OK) != 0) {
+            path = candidate.str();
+            error.clear();
+            return true;
+        }
+    }
+    error = "could not choose a unique raw JSONL path";
+    return false;
+}
 
 class UdpSession {
 public:
@@ -192,6 +371,7 @@ public:
         condition_.notify_all();
         if (socketFd_ >= 0) shutdown(socketFd_, SHUT_RDWR);
         if (receiverThread_.joinable()) receiverThread_.join();
+        rawRecorder_.stop();
         closeSocket();
     }
 
@@ -282,6 +462,21 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return streaming_;
+    }
+
+    bool startRawRecording(const std::string& path, std::string& error)
+    {
+        return rawRecorder_.start(path, error);
+    }
+
+    RawRecordingStats stopRawRecording()
+    {
+        return rawRecorder_.stop();
+    }
+
+    RawRecordingStats rawRecordingStats() const
+    {
+        return rawRecorder_.stats();
     }
 
 private:
@@ -429,31 +624,44 @@ private:
         streaming_ = streaming;
     }
 
-    void recordStreamFrame(const Frame& frame, std::size_t datagramLength)
+    void recordStreamFrame(
+        const Frame& frame,
+        const uint8_t* datagram,
+        std::size_t datagramLength,
+        const std::chrono::system_clock::time_point& receivedSystemTime,
+        const std::chrono::steady_clock::time_point& receivedSteadyTime)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++streamArrivalSerial_;
-        if (streaming_) {
-            ++totalPackets_;
-            totalBytes_ += datagramLength;
-            ++intervalPackets_;
-            intervalBytes_ += datagramLength;
-            lastFrameLength_ = datagramLength;
+        bool shouldRecord = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++streamArrivalSerial_;
+            if (streaming_) {
+                shouldRecord = true;
+                ++totalPackets_;
+                totalBytes_ += datagramLength;
+                ++intervalPackets_;
+                intervalBytes_ += datagramLength;
+                lastFrameLength_ = datagramLength;
 
-            if (!haveSequence_) {
-                haveSequence_ = true;
-                lastSequence_ = frame.sequence;
-            } else {
-                const uint8_t delta = static_cast<uint8_t>(frame.sequence - lastSequence_);
-                if (delta == 0) {
-                    ++duplicatePackets_;
-                } else if (delta < 128) {
-                    if (delta > 1) missingPackets_ += static_cast<uint64_t>(delta - 1);
+                if (!haveSequence_) {
+                    haveSequence_ = true;
                     lastSequence_ = frame.sequence;
                 } else {
-                    ++outOfOrderPackets_;
+                    const uint8_t delta = static_cast<uint8_t>(frame.sequence - lastSequence_);
+                    if (delta == 0) {
+                        ++duplicatePackets_;
+                    } else if (delta < 128) {
+                        if (delta > 1) missingPackets_ += static_cast<uint64_t>(delta - 1);
+                        lastSequence_ = frame.sequence;
+                    } else {
+                        ++outOfOrderPackets_;
+                    }
                 }
             }
+        }
+        if (shouldRecord) {
+            rawRecorder_.record(frame, datagram, datagramLength,
+                                receivedSystemTime, receivedSteadyTime);
         }
         condition_.notify_all();
     }
@@ -473,6 +681,10 @@ private:
                                            reinterpret_cast<sockaddr*>(&source),
                                            &sourceLength);
             if (count <= 0) continue;
+            const std::chrono::system_clock::time_point receivedSystemTime =
+                std::chrono::system_clock::now();
+            const std::chrono::steady_clock::time_point receivedSteadyTime =
+                std::chrono::steady_clock::now();
             if (source.sin_port != htons(kProtocolPort) ||
                 source.sin_addr.s_addr != clientNetworkAddress_.s_addr) {
                 continue;
@@ -487,7 +699,8 @@ private:
                 continue;
             }
             if (frame.command == CommandStream) {
-                recordStreamFrame(frame, static_cast<std::size_t>(count));
+                recordStreamFrame(frame, buffer, static_cast<std::size_t>(count),
+                                  receivedSystemTime, receivedSteadyTime);
                 continue;
             }
 
@@ -531,13 +744,15 @@ private:
     std::size_t lastFrameLength_ = 0;
     std::chrono::steady_clock::time_point lastStatsSample_ =
         std::chrono::steady_clock::now();
+    RawJsonlRecorder rawRecorder_;
 };
 
 void showMenu(bool connected,
               int frequency,
               const HotspotConfig& hotspot,
               const ClientLease& lease,
-              const StreamStats& stats);
+              const StreamStats& stats,
+              const RawRecordingStats& recording);
 
 std::string formatStats(const StreamStats& stats)
 {
@@ -558,11 +773,29 @@ std::string formatStats(const StreamStats& stats)
     return output.str();
 }
 
+std::string formatRecording(const RawRecordingStats& recording)
+{
+    std::ostringstream output;
+    output << "Raw JSONL: ";
+    if (recording.path.empty()) {
+        output << "idle";
+        return output.str();
+    }
+    output << (recording.active ? "recording" : "stopped")
+           << ", frames=" << recording.frameCount
+           << ", raw=" << std::fixed << std::setprecision(1)
+           << static_cast<double>(recording.rawBytes) / 1024.0 << " KiB"
+           << ", file=" << recording.path;
+    if (!recording.error.empty()) output << ", error=" << recording.error;
+    return output.str();
+}
+
 void showMenu(bool connected,
               int frequency,
               const HotspotConfig& hotspot,
               const ClientLease& lease,
-              const StreamStats& stats)
+              const StreamStats& stats,
+              const RawRecordingStats& recording)
 {
     std::cout
         << "\n==== VDSuit Wireless Receiver Emulator ====\n"
@@ -574,23 +807,38 @@ void showMenu(bool connected,
     if (connected) std::cout << ", " << frequency << " Hz";
     std::cout
         << '\n' << formatStats(stats)
+        << '\n' << formatRecording(recording)
         << "\n1. Link, handshake and start data\n"
         << "2. Disconnect\n"
         << "3. Set frame rate\n"
+        << "4. Start/stop raw JSONL recording\n"
         << "0. Exit\n"
         << "Select: " << std::flush;
 }
 
-void refreshStatsLine(const StreamStats& stats)
+void refreshStatusLines(const StreamStats& stats, const RawRecordingStats& recording)
 {
     if (!isatty(STDOUT_FILENO)) return;
 
-    // The Stream line is five rows above the Select prompt. Save the current
-    // cursor (including any partially typed input), update only that line, and
-    // restore the cursor without clearing the terminal.
-    std::cout << "\033[s\033[5A\r\033[2K"
-              << formatStats(stats)
+    // Stream and Raw JSONL are seven and six rows above the Select prompt.
+    // Preserve partially typed input while refreshing both status rows.
+    std::cout << "\033[s\033[7A\r\033[2K"
+              << formatStats(stats) << "\n\r\033[2K"
+              << formatRecording(recording)
               << "\033[u" << std::flush;
+}
+
+void stopRawRecordingWithReport(UdpSession& session)
+{
+    const RawRecordingStats before = session.rawRecordingStats();
+    if (!before.active) return;
+    const RawRecordingStats stopped = session.stopRawRecording();
+    std::cout << "Raw JSONL recording stopped: " << stopped.path
+              << " (" << stopped.frameCount << " frames, "
+              << stopped.rawBytes << " raw bytes)\n";
+    if (!stopped.error.empty()) {
+        std::cerr << "Raw JSONL warning: " << stopped.error << '\n';
+    }
 }
 
 bool readFrequency(int& frequency)
@@ -674,11 +922,14 @@ int main(int argc, char** argv)
     int frequency = 0;
     bool showMenuNow = true;
     StreamStats latestStats = session.sampleStats();
+    RawRecordingStats latestRecording = session.rawRecordingStats();
     std::string line;
     while (!shutdownRequested()) {
         if (showMenuNow) {
             latestStats = session.sampleStats();
-            showMenu(connected, frequency, hotspotConfig, lease, latestStats);
+            latestRecording = session.rawRecordingStats();
+            showMenu(connected, frequency, hotspotConfig, lease,
+                     latestStats, latestRecording);
             showMenuNow = false;
         }
 
@@ -687,7 +938,8 @@ int main(int argc, char** argv)
         if (ready < 0 && errno == EINTR) continue;
         if (ready == 0) {
             latestStats = session.sampleStats();
-            refreshStatsLine(latestStats);
+            latestRecording = session.rawRecordingStats();
+            refreshStatusLines(latestStats, latestRecording);
             continue;
         }
         if (ready < 0 || !(inputDescriptor.revents & (POLLIN | POLLHUP))) break;
@@ -724,6 +976,7 @@ int main(int argc, char** argv)
             } else if (!session.disconnect(error)) {
                 std::cerr << "Disconnect failed: " << error << '\n';
             } else {
+                stopRawRecordingWithReport(session);
                 connected = false;
                 frequency = 0;
                 std::cout << "Disconnected.\n";
@@ -744,7 +997,27 @@ int main(int argc, char** argv)
             }
             break;
         }
+        case '4': {
+            const RawRecordingStats recording = session.rawRecordingStats();
+            if (recording.active) {
+                stopRawRecordingWithReport(session);
+                break;
+            }
+            if (!connected) {
+                std::cout << "Connect and start the motion stream before recording.\n";
+                break;
+            }
+            std::string path;
+            if (!defaultRawRecordingPath(path, error) ||
+                !session.startRawRecording(path, error)) {
+                std::cerr << "Could not start raw JSONL recording: " << error << '\n';
+                break;
+            }
+            std::cout << "Raw JSONL recording started: " << path << '\n';
+            break;
+        }
         case '0':
+            stopRawRecordingWithReport(session);
             if (connected) {
                 if (!session.disconnect(error)) {
                     std::cerr << "Final disconnect warning: " << error << '\n';
@@ -765,6 +1038,7 @@ int main(int argc, char** argv)
     if (connected && !shutdownRequested()) {
         session.disconnect(error);
     }
+    stopRawRecordingWithReport(session);
     session.close();
     hotspot.stop();
     std::cout << "\nHotspot stopped and " << options.interfaceName << " restored.\n";

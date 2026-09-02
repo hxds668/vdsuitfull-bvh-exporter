@@ -2,6 +2,7 @@
 #include "../src/wireless_receiver.cpp"
 
 #include <cassert>
+#include <fstream>
 
 namespace {
 
@@ -133,12 +134,17 @@ private:
 
 void testSessionStateMachine()
 {
+    const std::string recordingPath =
+        "/tmp/vdsuit_wireless_raw_test_" + std::to_string(getpid()) + ".jsonl";
+    unlink(recordingPath.c_str());
+
     MockTransmitter transmitter;
     assert(transmitter.start());
 
     UdpSession session("lo", "127.0.0.1", "127.0.0.2", "127.0.0.2", false);
     std::string error;
     assert(session.open(error));
+    assert(session.startRawRecording(recordingPath, error));
 
     HandshakeInfo handshake;
     assert(session.connectAndStart(handshake, error));
@@ -150,6 +156,43 @@ void testSessionStateMachine()
 
     assert(session.setFrequency(72, error));
     assert(session.streaming());
+
+    RawRecordingStats recording = session.stopRawRecording();
+    assert(!recording.active);
+    assert(recording.error.empty());
+    assert(recording.frameCount == 2);
+    assert(recording.rawBytes > 0);
+
+    std::ifstream input(recordingPath.c_str(), std::ios::binary);
+    assert(input);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(input, line)) lines.push_back(line);
+    assert(lines.size() == recording.frameCount);
+
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        Frame expected;
+        expected.sequence = static_cast<uint8_t>(i);
+        expected.target = kBroadcastTarget;
+        expected.command = CommandStream;
+        expected.payload.assign(12, 0);
+        const std::vector<uint8_t> expectedWire = encodeFrame(expected);
+
+        assert(lines[i].find("\"schema\":\"vdsuit-wireless-raw-v1\"") !=
+               std::string::npos);
+        assert(lines[i].find("\"record_index\":" + std::to_string(i)) !=
+               std::string::npos);
+        assert(lines[i].find("\"sequence\":" + std::to_string(i)) !=
+               std::string::npos);
+        assert(lines[i].find("\"target\":65535") != std::string::npos);
+        assert(lines[i].find("\"command\":201") != std::string::npos);
+        assert(lines[i].find("\"payload_length\":12") != std::string::npos);
+        assert(lines[i].find("\"wire_hex\":\"" +
+                             hexString(expectedWire.data(), expectedWire.size()) + "\"") !=
+               std::string::npos);
+        assert(!lines[i].empty() && lines[i][0] == '{' && lines[i].back() == '}');
+    }
+
     assert(session.disconnect(error));
     assert(!session.streaming());
 
@@ -162,6 +205,7 @@ void testSessionStateMachine()
         CommandDisconnect
     };
     assert(transmitter.commands() == expected);
+    unlink(recordingPath.c_str());
 }
 
 } // namespace

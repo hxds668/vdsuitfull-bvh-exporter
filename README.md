@@ -226,9 +226,10 @@ bash tests/run_tests.sh
 testing. It creates a dedicated WPA2 hotspot on `wlan0`, assigns the transmitter
 a single DHCP lease, and sends the captured VDSuit private protocol over UDP
 port 8080. It receives and validates motion frames and reports packet rate,
-throughput, sequence gaps, duplicates, and malformed datagrams. It does not
-decode poses or generate BVH files. In an interactive terminal the stream
-status occupies one fixed menu row and is refreshed in place once per second.
+throughput, sequence gaps, duplicates, and malformed datagrams. Valid motion
+frames can also be recorded losslessly as JSONL. It does not decode poses or
+generate BVH files. In an interactive terminal the stream and recording status
+rows are refreshed in place once per second.
 For SDK pose processing and BVH output, use
 `vdsuit_bvh_exporter --wireless-ssid ...` instead.
 
@@ -267,8 +268,23 @@ Interactive commands:
 1  Link probe, handshake, and start motion data
 2  Disconnect the private protocol session
 3  Set 60/72/80/96 Hz and restart the stream
+4  Start/stop raw JSONL recording
 0  Exit
 ```
+
+Raw recordings are created under `records/` with timestamped names such as
+`vdsuit_raw_20260901_103015_123.jsonl`. Each valid motion frame is one complete
+JSON object on one line. `wire_hex` contains the exact received UDP datagram,
+including framing, permuted protocol body, terminator, and checksum; duplicate
+and out-of-order frames are retained. The remaining fields make recordings easy
+to inspect and replay:
+
+```json
+{"schema":"vdsuit-wireless-raw-v1","record_index":0,"received_unix_ns":1788239415123456789,"elapsed_ns":12345678,"sequence":42,"target":65535,"command":201,"datagram_length":275,"payload_length":264,"wire_hex":"5b2a..."}
+```
+
+Recording stops cleanly when command `4` is selected again, when the protocol is
+disconnected, or when the receiver exits.
 
 The program creates private temporary hostapd/dnsmasq configurations under
 `/run`, manages only the child processes it starts, and adds interface-scoped
